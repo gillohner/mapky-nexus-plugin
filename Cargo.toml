@@ -1,0 +1,29 @@
+[package]
+name = "mapky-nexus-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Mapky domain plugin for Nexus — indexes /pub/mapky.app/ events into Neo4j"
+
+[dependencies]
+nexus-common = { path = "../../pubky-nexus/nexus-common" }
+mapky-app-specs = { path = "../mapky-app-specs" }
+async-trait = "0.1.89"
+axum = "0.8.8"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+futures = "0.3"
+neo4rs = "0.8.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1"
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
+
+[dev-dependencies]
+pubky = { git = "https://github.com/pubky/pubky-core.git", package = "pubky", rev = "0ec564d746236f46553ef56888a3aef9c1096f55" }
+tokio = { version = "1.50.0", features = ["full"] }
+
+[[example]]
+name = "write_testnet"
+path = "examples/write_testnet.rs"
