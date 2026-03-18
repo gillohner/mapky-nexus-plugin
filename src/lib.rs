@@ -23,10 +23,6 @@ impl MapkyPlugin {
     pub fn new() -> Self {
         MapkyPlugin
     }
-
-    pub fn openapi_docs(&self) -> utoipa::openapi::OpenApi {
-        api::MapkyApiDoc::openapi()
-    }
 }
 
 impl Default for MapkyPlugin {
@@ -132,6 +128,10 @@ impl NexusPlugin for MapkyPlugin {
 
     fn routes(&self, ctx: PluginContext) -> Router {
         api::routes(ctx)
+    }
+
+    fn openapi_docs(&self) -> Option<utoipa::openapi::OpenApi> {
+        Some(api::MapkyApiDoc::openapi())
     }
 
     async fn setup_schema(&self, _ctx: &PluginContext) -> Result<(), DynError> {
