@@ -3,6 +3,7 @@ name = "mapky-nexus-plugin"
 version = "0.1.0"
 edition = "2021"
 description = "Mapky domain plugin for Nexus — indexes /pub/mapky.app/ events into Neo4j"
+license = "MIT"
 
 [dependencies]
 nexus-common = { path = "../../pubky-nexus/nexus-common" }
