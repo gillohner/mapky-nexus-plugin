@@ -10,10 +10,11 @@ pub mod models;
 pub mod queries;
 
 use axum::Router;
+use futures::TryStreamExt;
 use mapky_app_specs::MapkyAppObject;
 use utoipa::OpenApi;
 use nexus_common::db::get_neo4j_graph;
-use nexus_common::plugin::{NexusPlugin, PluginContext, PluginManifest};
+use nexus_common::plugin::{GraphNodeRef, NexusPlugin, PluginContext, PluginManifest};
 use nexus_common::types::DynError;
 use tracing::{debug, warn};
 
@@ -132,6 +133,36 @@ impl NexusPlugin for MapkyPlugin {
 
     fn openapi_docs(&self) -> Option<utoipa::openapi::OpenApi> {
         Some(api::MapkyApiDoc::openapi())
+    }
+
+    async fn resolve_graph_node(
+        &self,
+        resource_type: &str,
+        resource_id: &str,
+        _ctx: &PluginContext,
+    ) -> Result<Option<GraphNodeRef>, DynError> {
+        match resource_type {
+            "posts" => {
+                let graph = get_neo4j_graph()?;
+                let query = crate::queries::get::mapky_post_exists(resource_id);
+                let mut stream = graph.execute(query).await?;
+                let exists: bool = stream
+                    .try_next()
+                    .await?
+                    .and_then(|row| row.get("exists").ok())
+                    .unwrap_or(false);
+                if exists {
+                    Ok(Some(GraphNodeRef {
+                        label: "MapkyPost".to_string(),
+                        property: "id".to_string(),
+                        id: resource_id.to_string(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn setup_schema(&self, _ctx: &PluginContext) -> Result<(), DynError> {

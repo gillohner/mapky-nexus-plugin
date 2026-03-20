@@ -23,6 +23,7 @@ pub fn get_places_in_viewport(
                 p.osm_id AS osm_id,
                 p.lat AS lat,
                 p.lon AS lon,
+                p.geocoded AS geocoded,
                 p.review_count AS review_count,
                 p.avg_rating AS avg_rating,
                 p.tag_count AS tag_count,
@@ -47,6 +48,7 @@ pub fn get_place_by_canonical(osm_canonical: &str) -> Query {
                 p.osm_id AS osm_id,
                 p.lat AS lat,
                 p.lon AS lon,
+                p.geocoded AS geocoded,
                 p.review_count AS review_count,
                 p.avg_rating AS avg_rating,
                 p.tag_count AS tag_count,
@@ -85,6 +87,16 @@ pub fn place_exists(osm_canonical: &str) -> Query {
         "MATCH (p:Place {osm_canonical: $osm_canonical}) RETURN count(p) > 0 AS exists",
     )
     .param("osm_canonical", osm_canonical)
+}
+
+/// Check if a `MapkyPost` node exists by id.
+/// Used for cross-domain tag/bookmark resolution.
+pub fn mapky_post_exists(post_id: &str) -> Query {
+    Query::new(
+        "mapky_post_exists",
+        "MATCH (p:MapkyPost {id: $post_id}) RETURN count(p) > 0 AS exists",
+    )
+    .param("post_id", post_id)
 }
 
 /// Fetch only review posts (rating > 0) for a place, most recent first.
