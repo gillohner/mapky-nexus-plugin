@@ -1,7 +1,7 @@
 # mapky-nexus-plugin
 
 A [Pubky Nexus](https://github.com/pubky/pubky-nexus) plugin that indexes
-[MapKy](https://github.com/pubky/mapky) geo-social content into the shared
+[MapKy](https://github.com/gillohner/mapky) geo-social content into the shared
 Neo4j graph, exposing a REST API for place reviews, posts, and spatial queries.
 
 ## Overview
@@ -26,7 +26,7 @@ mapky-nexus-plugin
 
 ## Data Models
 
-All models are defined in [`mapky-app-specs`](../mapky-app-specs).
+All models are defined in [`mapky-app-specs`](https://github.com/gillohner/mapky-app-specs).
 
 | Model | Path | Indexed |
 |---|---|---|
@@ -151,6 +151,6 @@ mapky-nexus-plugin/
 
 ## Related
 
-- [mapky-app-specs](../mapky-app-specs) — Rust/WASM data model definitions
+- [mapky-app-specs](https://github.com/gillohner/mapky-app-specs) — Rust/WASM data model definitions
 - [pubky-nexus](https://github.com/pubky/pubky-nexus) — the host indexer
 - [pubky-app-specs](https://github.com/pubky/pubky-app-specs) — base traits (`Validatable`, `TimestampId`, `HashId`)
