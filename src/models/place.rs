@@ -1,15 +1,41 @@
 //! Place model — an OSM element stored as a Neo4j `:Place` node.
 
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use mapky_app_specs::OsmRef;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::warn;
 
-/// Public Nominatim API (1 req/s rate limit)
+/// Public Nominatim API — 1 request/second hard limit per usage policy.
 const NOMINATIM_URL: &str = "https://nominatim.openstreetmap.org";
+const NOMINATIM_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shared HTTP client — built once, reused across all geocoding calls.
+fn nominatim_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .user_agent("mapky-nexus-plugin/0.1 (+https://github.com/gillohner/mapky)")
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build Nominatim HTTP client")
+    })
+}
+
+/// Global rate-limit gate. All geocoding calls serialize through this mutex
+/// and sleep until 1 s has elapsed since the previous request, ensuring we
+/// never exceed Nominatim's 1 req/s policy even under concurrent event load.
+fn nominatim_rate_limiter() -> &'static Mutex<Instant> {
+    static LAST_REQUEST: OnceLock<Mutex<Instant>> = OnceLock::new();
+    LAST_REQUEST.get_or_init(|| {
+        // Subtract the interval so the first request fires immediately.
+        Mutex::new(Instant::now() - NOMINATIM_MIN_INTERVAL)
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaceDetails {
@@ -18,6 +44,10 @@ pub struct PlaceDetails {
     pub osm_id: i64,
     pub lat: f64,
     pub lon: f64,
+    /// `true` when coordinates were successfully resolved via Nominatim.
+    /// `false` means the place is stored at (0, 0) and should be backfilled
+    /// once geocoding succeeds (query: `MATCH (p:Place {geocoded: false})`).
+    pub geocoded: bool,
     pub review_count: i64,
     pub avg_rating: f64,
     pub tag_count: i64,
@@ -26,13 +56,14 @@ pub struct PlaceDetails {
 }
 
 impl PlaceDetails {
-    pub fn new(osm_type: &str, osm_id: i64, lat: f64, lon: f64) -> Self {
+    pub fn new(osm_type: &str, osm_id: i64, lat: f64, lon: f64, geocoded: bool) -> Self {
         Self {
             osm_canonical: format!("{osm_type}/{osm_id}"),
             osm_type: osm_type.to_string(),
             osm_id,
             lat,
             lon,
+            geocoded,
             review_count: 0,
             avg_rating: 0.0,
             tag_count: 0,
@@ -41,16 +72,22 @@ impl PlaceDetails {
         }
     }
 
-    /// Resolve OSM coordinates via Nominatim. Falls back to (0.0, 0.0) on failure.
+    /// Resolve OSM coordinates via Nominatim (rate-limited to 1 req/s).
+    ///
+    /// On failure the place is stored at (0, 0) with `geocoded: false` so it
+    /// can be identified and backfilled later.
     pub async fn from_osm_ref(osm_ref: &OsmRef) -> Self {
         let osm_type = osm_ref.osm_type.to_string();
         let osm_id = osm_ref.osm_id;
 
         match resolve_osm_coords(&osm_type, osm_id).await {
-            Some((lat, lon)) => Self::new(&osm_type, osm_id, lat, lon),
+            Some((lat, lon)) => Self::new(&osm_type, osm_id, lat, lon, true),
             None => {
-                warn!("Could not resolve coordinates for {osm_type}/{osm_id}, defaulting to (0,0)");
-                Self::new(&osm_type, osm_id, 0.0, 0.0)
+                warn!(
+                    "Could not resolve coordinates for {osm_type}/{osm_id}, \
+                     storing at (0,0) with geocoded=false for later backfill"
+                );
+                Self::new(&osm_type, osm_id, 0.0, 0.0, false)
             }
         }
     }
@@ -62,22 +99,35 @@ struct NominatimResult {
     lon: String,
 }
 
+/// Fetch coordinates from Nominatim, blocking behind the global rate limiter.
 async fn resolve_osm_coords(osm_type: &str, osm_id: i64) -> Option<(f64, f64)> {
-    let char = match osm_type {
+    let type_char = match osm_type {
         "node" => 'N',
         "way" => 'W',
         "relation" => 'R',
         _ => return None,
     };
 
-    let client = Client::builder()
-        .user_agent("mapky-nexus-plugin/0.1 (+https://github.com/gillohner/mapky-indexer)")
-        .timeout(Duration::from_secs(5))
-        .build()
-        .ok()?;
+    // Enforce the 1 req/s limit. All callers queue here; each holds the lock
+    // only long enough to update the timestamp, so no request is skipped.
+    {
+        let mut last = nominatim_rate_limiter().lock().await;
+        let elapsed = last.elapsed();
+        if elapsed < NOMINATIM_MIN_INTERVAL {
+            tokio::time::sleep(NOMINATIM_MIN_INTERVAL - elapsed).await;
+        }
+        *last = Instant::now();
+    }
 
-    let url = format!("{NOMINATIM_URL}/lookup?osm_ids={char}{osm_id}&format=json");
-    let results: Vec<NominatimResult> = client.get(&url).send().await.ok()?.json().await.ok()?;
+    let url = format!("{NOMINATIM_URL}/lookup?osm_ids={type_char}{osm_id}&format=json");
+    let results: Vec<NominatimResult> = nominatim_client()
+        .get(&url)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
 
     let first = results.into_iter().next()?;
     let lat = first.lat.parse::<f64>().ok()?;

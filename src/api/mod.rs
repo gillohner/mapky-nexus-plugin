@@ -15,6 +15,7 @@ use utoipa::OpenApi;
 
 use crate::models::place::PlaceDetails;
 use crate::models::post::PostDetails;
+use crate::models::tag::PostTagDetails;
 use crate::queries;
 
 pub fn routes(ctx: PluginContext) -> Router {
@@ -22,13 +23,14 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/viewport", get(viewport))
         .route("/place/{osm_type}/{osm_id}", get(place_detail))
         .route("/place/{osm_type}/{osm_id}/posts", get(place_posts))
+        .route("/posts/{author_id}/{post_id}/tags", get(post_tags))
         .with_state(ctx)
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(viewport, place_detail, place_posts),
-    components(schemas(PlaceDetails, PostDetails, ViewportQuery, PostsQuery))
+    paths(viewport, place_detail, place_posts, post_tags),
+    components(schemas(PlaceDetails, PostDetails, PostTagDetails, ViewportQuery, PostsQuery))
 )]
 pub struct MapkyApiDoc;
 
@@ -56,6 +58,14 @@ pub struct PostsQuery {
 
 fn default_limit() -> i64 {
     100
+}
+
+/// Strip the `author_id:` prefix from a compound Neo4j post id, returning just the short post_id.
+fn short_post_id(compound: &str) -> String {
+    compound
+        .split_once(':')
+        .map(|(_, post_id)| post_id.to_string())
+        .unwrap_or_else(|| compound.to_string())
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -118,6 +128,7 @@ async fn viewport(
             osm_id: row.get("osm_id").unwrap_or(0),
             lat: row.get("lat").unwrap_or(0.0),
             lon: row.get("lon").unwrap_or(0.0),
+            geocoded: row.get("geocoded").unwrap_or(false),
             review_count: row.get("review_count").unwrap_or(0),
             avg_rating: row.get("avg_rating").unwrap_or(0.0),
             tag_count: row.get("tag_count").unwrap_or(0),
@@ -165,6 +176,7 @@ async fn place_detail(
                 osm_id: row.get("osm_id").unwrap_or(0),
                 lat: row.get("lat").unwrap_or(0.0),
                 lon: row.get("lon").unwrap_or(0.0),
+                geocoded: row.get("geocoded").unwrap_or(false),
                 review_count: row.get("review_count").unwrap_or(0),
                 avg_rating: row.get("avg_rating").unwrap_or(0.0),
                 tag_count: row.get("tag_count").unwrap_or(0),
@@ -180,6 +192,71 @@ async fn place_detail(
             }),
         )),
     }
+}
+
+/// Get tags for a MapkyAppPost
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/posts/{author_id}/{post_id}/tags",
+    tag = "Mapky",
+    params(
+        ("author_id" = String, Path, description = "Author's pubky ID"),
+        ("post_id" = String, Path, description = "MapkyAppPost ID"),
+    ),
+    responses(
+        (status = 200, description = "Tags for a MapkyAppPost", body = Vec<PostTagDetails>),
+        (status = 404, description = "Post not found"),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn post_tags(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, post_id)): Path<(String, String)>,
+) -> ApiResult<Vec<PostTagDetails>> {
+    use std::collections::HashMap;
+
+    let compound_id = format!("{author_id}:{post_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+
+    let mut stream = graph
+        .execute(queries::get::get_tags_for_mapky_post(&compound_id))
+        .await
+        .map_err(graph_err)?;
+
+    let mut found = false;
+    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
+
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        found = true;
+        let label: Option<String> = row.get("label").ok();
+        let tagger_id: Option<String> = row.get("tagger_id").ok();
+        if let (Some(l), Some(t)) = (label, tagger_id) {
+            tag_map.entry(l).or_default().push(t);
+        }
+    }
+
+    if !found {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("Post {compound_id} not found"),
+            }),
+        ));
+    }
+
+    let tags: Vec<PostTagDetails> = tag_map
+        .into_iter()
+        .map(|(label, taggers)| {
+            let taggers_count = taggers.len();
+            PostTagDetails {
+                label,
+                taggers,
+                taggers_count,
+            }
+        })
+        .collect();
+
+    Ok(Json(tags))
 }
 
 /// List posts for a place, optionally filtered to reviews only
@@ -220,8 +297,9 @@ async fn place_posts(
         let rating_raw: Option<i64> = row.get("rating").ok();
         let rating = rating_raw.and_then(|r| if r > 0 { Some(r as u8) } else { None });
 
+        let compound_id: String = row.get("id").unwrap_or_default();
         let post = PostDetails {
-            id: row.get("id").unwrap_or_default(),
+            id: short_post_id(&compound_id),
             author_id: row.get("author_id").unwrap_or_default(),
             osm_canonical: row.get("osm_canonical").unwrap_or_default(),
             content: row.get("content").ok(),

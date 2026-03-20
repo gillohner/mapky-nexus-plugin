@@ -62,7 +62,7 @@ pub fn get_place_by_canonical(osm_canonical: &str) -> Query {
 pub fn get_posts_for_place(osm_canonical: &str, skip: i64, limit: i64) -> Query {
     Query::new(
         "mapky_place_posts",
-        "MATCH (u:User)-[:AUTHORED]->(p:MapkyPost)-[:ABOUT]->(:Place {osm_canonical: $osm_canonical})
+        "MATCH (u:User)-[:AUTHORED]->(p:MapkyAppPost)-[:ABOUT]->(:Place {osm_canonical: $osm_canonical})
          RETURN p.id AS id,
                 u.id AS author_id,
                 $osm_canonical AS osm_canonical,
@@ -89,12 +89,25 @@ pub fn place_exists(osm_canonical: &str) -> Query {
     .param("osm_canonical", osm_canonical)
 }
 
+/// Fetch all TAGGED relationships targeting a MapkyPost.
+/// Returns one row per (tagger, label) pair, plus an `exists` flag.
+/// If the post does not exist, the stream will be empty.
+pub fn get_tags_for_mapky_post(post_id: &str) -> Query {
+    Query::new(
+        "mapky_post_tags",
+        "MATCH (p:MapkyAppPost {id: $post_id})
+         OPTIONAL MATCH (tagger:User)-[tag:TAGGED]->(p)
+         RETURN true AS exists, tag.label AS label, tagger.id AS tagger_id",
+    )
+    .param("post_id", post_id)
+}
+
 /// Check if a `MapkyPost` node exists by id.
 /// Used for cross-domain tag/bookmark resolution.
 pub fn mapky_post_exists(post_id: &str) -> Query {
     Query::new(
         "mapky_post_exists",
-        "MATCH (p:MapkyPost {id: $post_id}) RETURN count(p) > 0 AS exists",
+        "MATCH (p:MapkyAppPost {id: $post_id}) RETURN count(p) > 0 AS exists",
     )
     .param("post_id", post_id)
 }
@@ -103,7 +116,7 @@ pub fn mapky_post_exists(post_id: &str) -> Query {
 pub fn get_reviews_for_place(osm_canonical: &str, skip: i64, limit: i64) -> Query {
     Query::new(
         "mapky_place_reviews",
-        "MATCH (u:User)-[:AUTHORED]->(p:MapkyPost)-[:ABOUT]->(:Place {osm_canonical: $osm_canonical})
+        "MATCH (u:User)-[:AUTHORED]->(p:MapkyAppPost)-[:ABOUT]->(:Place {osm_canonical: $osm_canonical})
          WHERE p.rating IS NOT NULL AND p.rating > 0
          RETURN p.id AS id,
                 u.id AS author_id,

@@ -44,15 +44,16 @@ pub async fn sync_put(post: &MapkyAppPost, user_id: &str, post_id: &str) -> Resu
         graph.run(queries::put::create_place(&place)).await?;
     }
 
-    // 3. Create the MapkyPost node with AUTHORED + ABOUT edges
+    // 3. Create the MapkyAppPost node with AUTHORED + ABOUT edges
+    // post_details.id is the compound key author_id:post_id
     let post_details = PostDetails::from_mapky_post(post, user_id, post_id);
     graph.run(queries::put::create_post(&post_details)).await?;
 
     // 4. Link to parent post if this is a reply (out-of-order safe — silently no-ops)
     if let Some(ref parent_uri) = post_details.parent_uri {
-        if let Some(parent_id) = extract_post_id_from_uri(parent_uri) {
+        if let Some(parent_compound_id) = extract_compound_id_from_uri(parent_uri) {
             graph
-                .run(queries::put::link_reply(&post_details.id, &parent_id))
+                .run(queries::put::link_reply(&post_details.id, &parent_compound_id))
                 .await?;
         }
     }
@@ -70,18 +71,19 @@ pub async fn sync_put(post: &MapkyAppPost, user_id: &str, post_id: &str) -> Resu
     Ok(())
 }
 
-/// Extract the post ID from a `pubky://<user>/pub/mapky.app/posts/<id>` URI.
+/// Extract a compound `author_id:post_id` key from a
+/// `pubky://<author_id>/pub/mapky.app/posts/<post_id>` URI.
 /// Returns `None` if the URI doesn't match the expected path structure.
-fn extract_post_id_from_uri(uri: &str) -> Option<String> {
-    // Expected: pubky://<user_id>/pub/mapky.app/posts/<post_id>
+fn extract_compound_id_from_uri(uri: &str) -> Option<String> {
+    // Expected: pubky://<author_id>/pub/mapky.app/posts/<post_id>
     let path = uri.strip_prefix("pubky://")?;
     let mut parts = path.splitn(2, "/pub/mapky.app/posts/");
-    parts.next()?; // user_id — discard
+    let author_id = parts.next()?;
     let post_id = parts.next()?.trim_end_matches('/');
-    if post_id.is_empty() {
+    if author_id.is_empty() || post_id.is_empty() {
         None
     } else {
-        Some(post_id.to_string())
+        Some(format!("{author_id}:{post_id}"))
     }
 }
 
@@ -89,10 +91,11 @@ fn extract_post_id_from_uri(uri: &str) -> Option<String> {
 pub async fn del(user_id: &str, post_id: &str) -> Result<(), DynError> {
     debug!("Deleting mapky post: {user_id}/{post_id}");
 
+    let compound_id = format!("{user_id}:{post_id}");
     let graph = get_neo4j_graph()?;
 
     let mut stream = graph
-        .execute(queries::del::delete_post(user_id, post_id))
+        .execute(queries::del::delete_post(user_id, &compound_id))
         .await?;
 
     // Roll back rating aggregate if the deleted post was a review

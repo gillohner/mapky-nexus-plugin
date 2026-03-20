@@ -139,12 +139,14 @@ impl NexusPlugin for MapkyPlugin {
         &self,
         resource_type: &str,
         resource_id: &str,
+        uri_owner_id: &str,
         _ctx: &PluginContext,
     ) -> Result<Option<GraphNodeRef>, DynError> {
         match resource_type {
             "posts" => {
+                let compound_id = format!("{uri_owner_id}:{resource_id}");
                 let graph = get_neo4j_graph()?;
-                let query = crate::queries::get::mapky_post_exists(resource_id);
+                let query = crate::queries::get::mapky_post_exists(&compound_id);
                 let mut stream = graph.execute(query).await?;
                 let exists: bool = stream
                     .try_next()
@@ -153,9 +155,9 @@ impl NexusPlugin for MapkyPlugin {
                     .unwrap_or(false);
                 if exists {
                     Ok(Some(GraphNodeRef {
-                        label: "MapkyPost".to_string(),
+                        label: "MapkyAppPost".to_string(),
                         property: "id".to_string(),
-                        id: resource_id.to_string(),
+                        id: compound_id,
                     }))
                 } else {
                     Ok(None)
@@ -180,11 +182,11 @@ impl NexusPlugin for MapkyPlugin {
                 "CREATE POINT INDEX mapky_place_location IF NOT EXISTS \
                  FOR (p:Place) ON (p.location)",
             ),
-            // MapkyPost uniqueness constraint (:MapkyPost avoids nexus's :Post collision)
+            // MapkyAppPost uniqueness constraint — id is the compound key author_id:post_id
             (
                 "mapky_schema_post_unique",
                 "CREATE CONSTRAINT mapky_post_unique IF NOT EXISTS \
-                 FOR (p:MapkyPost) REQUIRE p.id IS UNIQUE",
+                 FOR (p:MapkyAppPost) REQUIRE p.id IS UNIQUE",
             ),
         ];
 

@@ -23,6 +23,7 @@ utoipa = { version = "5.4.0", features = ["axum_extras"] }
 
 [dev-dependencies]
 pubky = { git = "https://github.com/pubky/pubky-core.git", package = "pubky", rev = "0ec564d746236f46553ef56888a3aef9c1096f55" }
+pubky-app-specs = { path = "../../pubky-app-specs" }
 tokio = { version = "1.50.0", features = ["full"] }
 
 [[example]]

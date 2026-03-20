@@ -20,7 +20,7 @@ pub struct PostDetails {
 impl PostDetails {
     pub fn from_mapky_post(post: &MapkyAppPost, user_id: &str, post_id: &str) -> Self {
         Self {
-            id: post_id.to_string(),
+            id: format!("{user_id}:{post_id}"),
             author_id: user_id.to_string(),
             osm_canonical: post.place.canonical(),
             content: post.content.clone(),

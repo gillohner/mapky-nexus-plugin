@@ -1,6 +1,7 @@
 //! Neo4j write queries for the mapky plugin.
 //!
-//! Uses `:MapkyPost` label to avoid collision with nexus's existing `:Post` label.
+//! Uses `:MapkyAppPost` label to avoid collision with nexus's existing `:Post` label.
+//! Post identity follows the same compound-key convention as nexus: `author_id:post_id`.
 
 use crate::models::place::PlaceDetails;
 use crate::models::post::PostDetails;
@@ -28,6 +29,7 @@ pub fn create_place(place: &PlaceDetails) -> Query {
              p.location = point({latitude: $lat, longitude: $lon}),
              p.lat = $lat,
              p.lon = $lon,
+             p.geocoded = $geocoded,
              p.review_count = 0,
              p.avg_rating = 0.0,
              p.tag_count = 0,
@@ -39,16 +41,18 @@ pub fn create_place(place: &PlaceDetails) -> Query {
     .param("osm_id", place.osm_id)
     .param("lat", place.lat)
     .param("lon", place.lon)
+    .param("geocoded", place.geocoded)
     .param("indexed_at", place.indexed_at)
 }
 
-/// Create a MapkyPost node with AUTHORED and ABOUT relationships.
+/// Create a MapkyAppPost node with AUTHORED and ABOUT relationships.
+/// `post.id` is the compound key `author_id:post_id`.
 pub fn create_post(post: &PostDetails) -> Query {
     Query::new(
         "mapky_create_post",
         "MATCH (author:User {id: $author_id})
          MATCH (place:Place {osm_canonical: $osm_canonical})
-         MERGE (author)-[:AUTHORED]->(p:MapkyPost {id: $post_id})
+         MERGE (author)-[:AUTHORED]->(p:MapkyAppPost {id: $post_id})
          MERGE (p)-[:ABOUT]->(place)
          ON CREATE SET p.indexed_at = $indexed_at
          SET p.content = $content,
@@ -71,11 +75,12 @@ pub fn create_post(post: &PostDetails) -> Query {
 /// Create a REPLY_TO edge from a child post to its parent.
 /// Uses MATCH for the parent — if the parent doesn't exist yet (out-of-order
 /// delivery), the query silently does nothing.
+/// `child_id` and `parent_id` are both compound keys (`author_id:post_id`).
 pub fn link_reply(child_id: &str, parent_id: &str) -> Query {
     Query::new(
         "mapky_link_reply",
-        "MATCH (child:MapkyPost {id: $child_id})
-         MATCH (parent:MapkyPost {id: $parent_id})
+        "MATCH (child:MapkyAppPost {id: $child_id})
+         MATCH (parent:MapkyAppPost {id: $parent_id})
          MERGE (child)-[:REPLY_TO]->(parent)",
     )
     .param("child_id", child_id)

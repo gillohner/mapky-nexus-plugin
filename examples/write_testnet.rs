@@ -32,6 +32,8 @@
 use mapky_app_specs::traits::{HasIdPath, TimestampId};
 use mapky_app_specs::{MapkyAppPost, MapkyAppPostKind, OsmElementType, OsmRef};
 use pubky::{Keypair, PubkyHttpClient, PublicKey};
+use pubky_app_specs::traits::HashId;
+use pubky_app_specs::PubkyAppTag;
 
 /// The homeserver public key from pubky-docker config.toml.
 /// Must match the instance you're running.
@@ -137,6 +139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "\n── Writing {} posts to homeserver ────────────────",
         posts.len()
     );
+    // Track (author_pk, post_id) so we can tag them afterwards.
+    let mut written_posts: Vec<(String, String)> = Vec::new();
     for (i, (place, content, rating)) in posts.iter().enumerate() {
         let (ref user_pk, ref session) = sessions[i % sessions.len()];
 
@@ -170,13 +174,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let body = response.text().await.unwrap_or_default();
             eprintln!("    ERROR: {body}");
         }
+
+        written_posts.push((user_pk.clone(), post_id));
     }
+
+    // ── Write PubkyAppTag entries ────────────────────────────────────────────
+    // post1 = Hafenbar review (index 0), post4 = Bitcoin Ekasi review (index 3)
+    // post6 = Insider review (index 5)
+    //
+    // user1 tags post1 with "bitcoin-bar"
+    // user1 tags post4 with "bitcoin-bar"
+    // user2 tags post1 with "cozy"
+    // user2 tags post6 with "great-food"
+
+    let tag_targets: &[(usize, usize, &str)] = &[
+        (0, 0, "bitcoin-bar"), // user1 → post1
+        (0, 3, "bitcoin-bar"), // user1 → post4
+        (1, 0, "cozy"),        // user2 → post1
+        (1, 5, "great-food"),  // user2 → post6
+    ];
+
+    println!("\n── Writing {} tags to homeserver ─────────────────", tag_targets.len());
+    for (user_idx, post_idx, label) in tag_targets {
+        let (ref tagger_pk, ref tagger_session) = sessions[*user_idx];
+        let (ref post_author_pk, ref post_id) = written_posts[*post_idx];
+
+        // Build the full pubky URI for the target post
+        let post_uri = format!(
+            "pubky://{}/pub/mapky.app/posts/{}",
+            post_author_pk, post_id
+        );
+
+        let tag = PubkyAppTag::new(post_uri, label.to_string());
+        let tag_id = tag.create_id();
+        let path = PubkyAppTag::create_path(&tag_id);
+
+        let body = serde_json::to_vec(&tag)?;
+        let response = tagger_session.storage().put(&path, body).await?;
+
+        let status = response.status();
+        println!(
+            "  [{status}] {:.12}… → {path}  (label: {label})",
+            tagger_pk
+        );
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            eprintln!("    ERROR: {body}");
+        }
+    }
+
+    let (post1_author, post1_id) = &written_posts[0];
 
     println!("\n── Done ──────────────────────────────────────────");
     println!(
-        "  {} users, {} posts written to homeserver",
+        "  {} users, {} posts, {} tags written to homeserver",
         user_count,
-        posts.len()
+        posts.len(),
+        tag_targets.len(),
     );
     println!();
     println!("  nexusd will index these on its next watcher poll cycle (~5s).");
@@ -187,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("  curl -s 'localhost:8080/v0/mapky/place/node/1573053883/posts' | jq .  # Hafenbar, Luzern");
     println!("  curl -s 'localhost:8080/v0/mapky/place/way/618456759/posts' | jq .    # Bitcoin Ekasi, Mossel Bay");
     println!("  curl -s 'localhost:8080/v0/mapky/place/node/3646146894/posts' | jq .  # Insider, Zürich");
+    println!("  curl -s 'localhost:8080/v0/mapky/posts/{post1_author}/{post1_id}/tags' | jq .  # tags on post1 (Hafenbar review)");
     println!();
     println!("  User public keys (for events-stream debugging):");
     for (i, (pk, _)) in sessions.iter().enumerate() {
