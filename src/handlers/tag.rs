@@ -9,8 +9,16 @@ use chrono::Utc;
 use futures::TryStreamExt;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::types::DynError;
-use pubky_app_specs::PubkyAppTag;
+use serde::Deserialize;
 use tracing::debug;
+
+/// Lightweight deserialization target — avoids depending on `pubky-app-specs`
+/// types which may conflict with the version used by `nexus-common`.
+#[derive(Deserialize)]
+struct PubkyTag {
+    uri: String,
+    label: String,
+}
 
 use crate::models::place::{osm_canonical_from_url, PlaceDetails};
 use crate::queries;
@@ -30,7 +38,7 @@ fn neo4j_label_for(resource_type: &str) -> Option<&'static str> {
 }
 
 pub async fn sync_put(data: &[u8], tagger_user_id: &str, tag_id: &str) -> Result<(), DynError> {
-    let tag: PubkyAppTag = serde_json::from_slice(data)
+    let tag: PubkyTag = serde_json::from_slice(data)
         .map_err(|e| format!("Failed to deserialize PubkyAppTag: {e}"))?;
 
     debug!(

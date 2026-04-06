@@ -8,7 +8,6 @@ license = "MIT"
 [dependencies]
 nexus-common = { path = "../../pubky-nexus/nexus-common" }
 mapky-app-specs = { path = "../mapky-app-specs" }
-pubky-app-specs = { path = "../../pubky-app-specs" }
 async-trait = "0.1.89"
 axum = "0.8.8"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
@@ -27,8 +26,8 @@ anyhow = "1.0"
 futures = "0.3"
 mapky-app-specs = { path = "../mapky-app-specs" }
 nexus-watcher = { path = "../../pubky-nexus/nexus-watcher", features = ["testing"] }
-pubky = { git = "https://github.com/pubky/pubky-core.git", package = "pubky", rev = "0ec564d746236f46553ef56888a3aef9c1096f55" }
-pubky-app-specs = { path = "../../pubky-app-specs" }
+pubky = "0.7.0"
+pubky-app-specs = { git = "https://github.com/gillohner/pubky-app-specs", rev = "b8f7f23" }
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-shared-rt = "0.1"
 

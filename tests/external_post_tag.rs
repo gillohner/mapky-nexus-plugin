@@ -10,10 +10,9 @@ use nexus_common::db::get_neo4j_graph;
 use nexus_common::db::graph::Query;
 use nexus_watcher::testing::WatcherTest;
 use pubky::Keypair;
-use pubky_app_specs::{
-    traits::{HasIdPath, HashId, TimestampId},
-    PubkyAppTag, PubkyAppUser,
-};
+use mapky_app_specs::traits::{HasIdPath, TimestampId};
+use pubky_app_specs::traits::{HasIdPath as PubkyHasIdPath, HashId};
+use pubky_app_specs::{PubkyAppTag, PubkyAppUser};
 use std::sync::Arc;
 
 #[tokio_shared_rt::test(shared)]
