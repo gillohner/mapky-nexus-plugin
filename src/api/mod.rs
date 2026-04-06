@@ -31,15 +31,18 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/place/{osm_type}/{osm_id}/tags", get(place_tags))
         // ── Post ──
         .route("/posts/{author_id}/{post_id}/tags", get(post_tags))
+        .route("/posts/user/{user_id}", get(user_posts))
         // ── Incident ──
         .route("/incidents/viewport", get(incidents_viewport))
         .route("/incidents/{author_id}/{incident_id}", get(incident_detail))
+        .route("/incidents/user/{user_id}", get(user_incidents))
         // ── GeoCapture ──
         .route("/geo_captures/viewport", get(geo_captures_viewport))
         .route(
             "/geo_captures/{author_id}/{capture_id}",
             get(geo_capture_detail),
         )
+        .route("/geo_captures/user/{user_id}", get(user_geo_captures))
         // ── Collection ──
         .route(
             "/collections/{author_id}/{collection_id}",
@@ -60,9 +63,10 @@ pub fn routes(ctx: PluginContext) -> Router {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        viewport, place_detail, place_posts, place_tags, post_tags,
-        incidents_viewport, incident_detail,
-        geo_captures_viewport, geo_capture_detail,
+        viewport, place_detail, place_posts, place_tags,
+        post_tags, user_posts,
+        incidents_viewport, incident_detail, user_incidents,
+        geo_captures_viewport, geo_capture_detail, user_geo_captures,
         collection_detail, user_collections, collections_for_place,
         routes_viewport, route_detail, user_routes,
     ),
@@ -307,6 +311,53 @@ async fn post_tags(
     Ok(Json(tags))
 }
 
+/// List a user's posts
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/posts/user/{user_id}",
+    tag = "Post",
+    params(
+        ("user_id" = String, Path, description = "User's pubky ID"),
+        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "User's posts", body = Vec<PostDetails>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn user_posts(
+    State(_ctx): State<PluginContext>,
+    Path(user_id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> ApiResult<Vec<PostDetails>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_user_posts(&user_id, params.skip, params.limit))
+        .await
+        .map_err(graph_err)?;
+
+    let mut posts = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        let rating_raw: Option<i64> = row.get("rating").ok();
+        let rating = rating_raw.and_then(|r| if r > 0 { Some(r as u8) } else { None });
+        let compound_id: String = row.get("id").unwrap_or_default();
+        posts.push(PostDetails {
+            id: short_post_id(&compound_id),
+            author_id: row.get("author_id").unwrap_or_default(),
+            osm_canonical: row.get("osm_canonical").unwrap_or_default(),
+            content: row.get("content").ok(),
+            rating,
+            kind: row.get("kind").unwrap_or_else(|_| "post".to_string()),
+            parent_uri: row.get("parent_uri").ok(),
+            attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+
+    Ok(Json(posts))
+}
+
 /// List posts for a place, optionally filtered to reviews only
 #[utoipa::path(
     get,
@@ -533,6 +584,52 @@ async fn incident_detail(
     }
 }
 
+/// List a user's incidents
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/incidents/user/{user_id}",
+    tag = "Incident",
+    params(
+        ("user_id" = String, Path, description = "User's pubky ID"),
+        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "User's incidents", body = Vec<IncidentDetails>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn user_incidents(
+    State(_ctx): State<PluginContext>,
+    Path(user_id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> ApiResult<Vec<IncidentDetails>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_user_incidents(&user_id, params.skip, params.limit))
+        .await
+        .map_err(graph_err)?;
+
+    let mut incidents = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        incidents.push(IncidentDetails {
+            id: row.get("id").unwrap_or_default(),
+            author_id: row.get("author_id").unwrap_or_default(),
+            incident_type: row.get("incident_type").unwrap_or_default(),
+            severity: row.get("severity").unwrap_or_default(),
+            lat: row.get("lat").unwrap_or(0.0),
+            lon: row.get("lon").unwrap_or(0.0),
+            heading: row.get("heading").ok(),
+            description: row.get("description").ok(),
+            attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
+            expires_at: row.get("expires_at").ok(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+
+    Ok(Json(incidents))
+}
+
 // ── GeoCaptures ─────────────────────────────────────────────────────────────
 
 /// List geo captures within a geographic bounding box
@@ -641,6 +738,59 @@ async fn geo_capture_detail(
             }),
         )),
     }
+}
+
+/// List a user's geo captures
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/geo_captures/user/{user_id}",
+    tag = "GeoCapture",
+    params(
+        ("user_id" = String, Path, description = "User's pubky ID"),
+        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "User's geo captures", body = Vec<GeoCaptureDetails>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn user_geo_captures(
+    State(_ctx): State<PluginContext>,
+    Path(user_id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> ApiResult<Vec<GeoCaptureDetails>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_user_geo_captures(
+            &user_id,
+            params.skip,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut captures = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        captures.push(GeoCaptureDetails {
+            id: row.get("id").unwrap_or_default(),
+            author_id: row.get("author_id").unwrap_or_default(),
+            file_uri: row.get("file_uri").unwrap_or_default(),
+            kind: row.get("kind").unwrap_or_default(),
+            lat: row.get("lat").unwrap_or(0.0),
+            lon: row.get("lon").unwrap_or(0.0),
+            ele: row.get("ele").ok(),
+            heading: row.get("heading").ok(),
+            pitch: row.get("pitch").ok(),
+            fov: row.get("fov").ok(),
+            caption: row.get("caption").ok(),
+            sequence_uri: row.get("sequence_uri").ok(),
+            sequence_index: row.get("sequence_index").ok(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+
+    Ok(Json(captures))
 }
 
 // ── Collections ─────────────────────────────────────────────────────────────

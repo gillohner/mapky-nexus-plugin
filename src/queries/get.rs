@@ -13,7 +13,8 @@ pub fn get_places_in_viewport(
     Query::new(
         "mapky_viewport",
         "MATCH (p:Place)
-         WHERE point.withinBBox(
+         WHERE p.geocoded = true
+           AND point.withinBBox(
              p.location,
              point({latitude: $min_lat, longitude: $min_lon}),
              point({latitude: $max_lat, longitude: $max_lon})
@@ -110,6 +111,77 @@ pub fn mapky_post_exists(post_id: &str) -> Query {
         "MATCH (p:MapkyAppPost {id: $post_id}) RETURN count(p) > 0 AS exists",
     )
     .param("post_id", post_id)
+}
+
+/// Fetch a user's posts, most recent first.
+pub fn get_user_posts(user_id: &str, skip: i64, limit: i64) -> Query {
+    Query::new(
+        "mapky_user_posts",
+        "MATCH (u:User {id: $user_id})-[:AUTHORED]->(p:MapkyAppPost)-[:ABOUT]->(place:Place)
+         RETURN p.id AS id,
+                u.id AS author_id,
+                place.osm_canonical AS osm_canonical,
+                p.content AS content,
+                p.rating AS rating,
+                p.kind AS kind,
+                p.parent_uri AS parent_uri,
+                p.attachments AS attachments,
+                p.indexed_at AS indexed_at
+         ORDER BY p.indexed_at DESC
+         SKIP $skip LIMIT $limit",
+    )
+    .param("user_id", user_id)
+    .param("skip", skip)
+    .param("limit", limit)
+}
+
+/// Fetch a user's incidents, most recent first.
+pub fn get_user_incidents(user_id: &str, skip: i64, limit: i64) -> Query {
+    Query::new(
+        "mapky_user_incidents",
+        "MATCH (u:User {id: $user_id})-[:REPORTED]->(i:MapkyAppIncident)
+         RETURN i.id AS id,
+                u.id AS author_id,
+                i.incident_type AS incident_type,
+                i.severity AS severity,
+                i.lat AS lat, i.lon AS lon,
+                i.heading AS heading,
+                i.description AS description,
+                i.attachments AS attachments,
+                i.expires_at AS expires_at,
+                i.indexed_at AS indexed_at
+         ORDER BY i.indexed_at DESC
+         SKIP $skip LIMIT $limit",
+    )
+    .param("user_id", user_id)
+    .param("skip", skip)
+    .param("limit", limit)
+}
+
+/// Fetch a user's geo captures, most recent first.
+pub fn get_user_geo_captures(user_id: &str, skip: i64, limit: i64) -> Query {
+    Query::new(
+        "mapky_user_geo_captures",
+        "MATCH (u:User {id: $user_id})-[:CAPTURED]->(g:MapkyAppGeoCapture)
+         RETURN g.id AS id,
+                u.id AS author_id,
+                g.file_uri AS file_uri,
+                g.kind AS kind,
+                g.lat AS lat, g.lon AS lon,
+                g.ele AS ele,
+                g.heading AS heading,
+                g.pitch AS pitch,
+                g.fov AS fov,
+                g.caption AS caption,
+                g.sequence_uri AS sequence_uri,
+                g.sequence_index AS sequence_index,
+                g.indexed_at AS indexed_at
+         ORDER BY g.indexed_at DESC
+         SKIP $skip LIMIT $limit",
+    )
+    .param("user_id", user_id)
+    .param("skip", skip)
+    .param("limit", limit)
 }
 
 /// Fetch tags on a Place node, aggregated by label.
