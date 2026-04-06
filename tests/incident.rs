@@ -65,7 +65,7 @@ async fn test_incident_lifecycle() -> Result<()> {
     let lat: f64 = row.get("lat")?;
     let incident_type: String = row.get("incident_type")?;
     assert!((lat - 47.3769).abs() < 0.001);
-    assert_eq!(incident_type, "Flooding");
+    assert_eq!(incident_type, "flooding");
 
     // Delete and verify gone.
     test.del(&user_kp, &incident_path).await?;

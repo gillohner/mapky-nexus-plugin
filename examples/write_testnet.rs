@@ -29,10 +29,10 @@
 //! curl -s 'localhost:8080/v0/mapky/place/node/3646146894/posts' | jq .   # Insider, Zürich
 //! ```
 
-use mapky_app_specs::traits::{HasIdPath, TimestampId};
+use mapky_app_specs::traits::{HasIdPath as MapkyHasIdPath, TimestampId};
 use mapky_app_specs::{MapkyAppPost, MapkyAppPostKind};
 use pubky::{Keypair, PubkyHttpClient, PublicKey};
-use pubky_app_specs::traits::HashId;
+use pubky_app_specs::traits::{HashId, HasIdPath as PubkyHasIdPath};
 use pubky_app_specs::PubkyAppTag;
 
 /// The homeserver public key from pubky-docker config.toml.

@@ -65,7 +65,7 @@ async fn test_geo_capture_lifecycle() -> Result<()> {
     let row = row.unwrap();
     let kind: String = row.get("kind")?;
     let ele: f64 = row.get("ele")?;
-    assert_eq!(kind, "Photo");
+    assert_eq!(kind, "photo");
     assert!((ele - 540.0).abs() < 0.1);
 
     // Delete and verify.
