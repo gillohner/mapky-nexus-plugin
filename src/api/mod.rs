@@ -62,6 +62,14 @@ pub fn routes(ctx: PluginContext) -> Router {
 
 #[derive(OpenApi)]
 #[openapi(
+    tags(
+        (name = "Place", description = "Places (OSM nodes/ways) and spatial queries"),
+        (name = "Post", description = "Posts and reviews on places"),
+        (name = "Incident", description = "Geo-located incidents"),
+        (name = "GeoCapture", description = "Geo-located captures (photos, audio, video)"),
+        (name = "Collection", description = "Curated collections of places"),
+        (name = "Route", description = "Routes and trails"),
+    ),
     paths(
         viewport, place_detail, place_posts, place_tags,
         post_tags, user_posts,
