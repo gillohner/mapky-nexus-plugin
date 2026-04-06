@@ -138,7 +138,7 @@ fn graph_err(e: impl ToString) -> (StatusCode, Json<ApiError>) {
 #[utoipa::path(
     get,
     path = "/v0/mapky/viewport",
-    tag = "Mapky",
+    tag = "Place",
     params(
         ("min_lat" = f64, Query, description = "Minimum latitude"),
         ("min_lon" = f64, Query, description = "Minimum longitude"),
@@ -193,7 +193,7 @@ async fn viewport(
 #[utoipa::path(
     get,
     path = "/v0/mapky/place/{osm_type}/{osm_id}",
-    tag = "Mapky",
+    tag = "Place",
     params(
         ("osm_type" = String, Path, description = "OSM element type: node, way, or relation"),
         ("osm_id" = i64, Path, description = "OSM element ID")
@@ -246,7 +246,7 @@ async fn place_detail(
 #[utoipa::path(
     get,
     path = "/v0/mapky/posts/{author_id}/{post_id}/tags",
-    tag = "Mapky",
+    tag = "Post",
     params(
         ("author_id" = String, Path, description = "Author's pubky ID"),
         ("post_id" = String, Path, description = "MapkyAppPost ID"),
@@ -311,7 +311,7 @@ async fn post_tags(
 #[utoipa::path(
     get,
     path = "/v0/mapky/place/{osm_type}/{osm_id}/posts",
-    tag = "Mapky",
+    tag = "Place",
     params(
         ("osm_type" = String, Path, description = "OSM element type: node, way, or relation"),
         ("osm_id" = i64, Path, description = "OSM element ID"),
@@ -369,7 +369,7 @@ async fn place_posts(
 #[utoipa::path(
     get,
     path = "/v0/mapky/place/{osm_type}/{osm_id}/tags",
-    tag = "Mapky",
+    tag = "Place",
     params(
         ("osm_type" = String, Path, description = "OSM element type"),
         ("osm_id" = i64, Path, description = "OSM element ID"),
@@ -435,7 +435,7 @@ async fn place_tags(
 #[utoipa::path(
     get,
     path = "/v0/mapky/incidents/viewport",
-    tag = "Mapky",
+    tag = "Incident",
     params(
         ("min_lat" = f64, Query, description = "Minimum latitude"),
         ("min_lon" = f64, Query, description = "Minimum longitude"),
@@ -488,7 +488,7 @@ async fn incidents_viewport(
 #[utoipa::path(
     get,
     path = "/v0/mapky/incidents/{author_id}/{incident_id}",
-    tag = "Mapky",
+    tag = "Incident",
     params(
         ("author_id" = String, Path, description = "Author's pubky ID"),
         ("incident_id" = String, Path, description = "Incident ID"),
@@ -539,7 +539,7 @@ async fn incident_detail(
 #[utoipa::path(
     get,
     path = "/v0/mapky/geo_captures/viewport",
-    tag = "Mapky",
+    tag = "GeoCapture",
     params(
         ("min_lat" = f64, Query, description = "Minimum latitude"),
         ("min_lon" = f64, Query, description = "Minimum longitude"),
@@ -595,7 +595,7 @@ async fn geo_captures_viewport(
 #[utoipa::path(
     get,
     path = "/v0/mapky/geo_captures/{author_id}/{capture_id}",
-    tag = "Mapky",
+    tag = "GeoCapture",
     params(
         ("author_id" = String, Path, description = "Author's pubky ID"),
         ("capture_id" = String, Path, description = "GeoCapture ID"),
@@ -649,7 +649,7 @@ async fn geo_capture_detail(
 #[utoipa::path(
     get,
     path = "/v0/mapky/collections/{author_id}/{collection_id}",
-    tag = "Mapky",
+    tag = "Collection",
     params(
         ("author_id" = String, Path, description = "Author's pubky ID"),
         ("collection_id" = String, Path, description = "Collection ID"),
@@ -694,7 +694,7 @@ async fn collection_detail(
 #[utoipa::path(
     get,
     path = "/v0/mapky/collections/user/{user_id}",
-    tag = "Mapky",
+    tag = "Collection",
     params(
         ("user_id" = String, Path, description = "User's pubky ID"),
         ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
@@ -740,7 +740,7 @@ async fn user_collections(
 #[utoipa::path(
     get,
     path = "/v0/mapky/collections/place/{osm_type}/{osm_id}",
-    tag = "Mapky",
+    tag = "Collection",
     params(
         ("osm_type" = String, Path, description = "OSM element type"),
         ("osm_id" = i64, Path, description = "OSM element ID"),
@@ -783,7 +783,7 @@ async fn collections_for_place(
 #[utoipa::path(
     get,
     path = "/v0/mapky/routes/viewport",
-    tag = "Mapky",
+    tag = "Route",
     params(
         ("min_lat" = f64, Query, description = "Minimum latitude"),
         ("min_lon" = f64, Query, description = "Minimum longitude"),
@@ -824,7 +824,7 @@ async fn routes_viewport(
 #[utoipa::path(
     get,
     path = "/v0/mapky/routes/{author_id}/{route_id}",
-    tag = "Mapky",
+    tag = "Route",
     params(
         ("author_id" = String, Path, description = "Author's pubky ID"),
         ("route_id" = String, Path, description = "Route ID"),
@@ -861,7 +861,7 @@ async fn route_detail(
 #[utoipa::path(
     get,
     path = "/v0/mapky/routes/user/{user_id}",
-    tag = "Mapky",
+    tag = "Route",
     params(
         ("user_id" = String, Path, description = "User's pubky ID"),
         ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
