@@ -4,11 +4,11 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures::TryStreamExt;
-use mapky_app_specs::{MapkyAppPost, MapkyAppPostKind, OsmElementType, OsmRef};
+use mapky_app_specs::{MapkyAppPost, MapkyAppPostKind};
 use mapky_nexus_plugin::MapkyPlugin;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::db::graph::Query;
-use nexus_watcher::testing::{HomeserverIdPath, WatcherTest};
+use nexus_watcher::testing::WatcherTest;
 use pubky::Keypair;
 use pubky_app_specs::{
     traits::{HasIdPath, HashId, TimestampId},
@@ -35,7 +35,7 @@ async fn test_pubky_tag_on_mapky_post() -> Result<()> {
     // ── Step 2: Write a MapkyAppPost to the homeserver ─────────────────────────
     let mapky_post = MapkyAppPost::new(
         MapkyAppPostKind::Review,
-        OsmRef::new(OsmElementType::Node, 1573053883),
+        "https://www.openstreetmap.org/node/1573053883".to_string(),
         Some("Great Bitcoin bar!".to_string()),
         Some(9),
         None,

@@ -32,7 +32,7 @@ src/
 
 ## Event Handling
 
-Currently handles `posts` resource type. Other types (`location_tags`, `collections`, `incidents`, `geo_captures`, `routes`) are stubbed with debug logging.
+Currently handles `posts` resource type. Other types (`collections`, `incidents`, `geo_captures`, `routes`) are stubbed with debug logging. Tags on places use standard `PubkyAppTag` (universal tags) stored at `/pub/mapky.app/tags/`, indexed by pubky-nexus core as `Resource` nodes.
 
 ### PUT flow (posts)
 1. Ensure `:User` exists (MERGE, reuses nexus core's User nodes)

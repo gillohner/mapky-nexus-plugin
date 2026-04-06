@@ -24,9 +24,7 @@ pub async fn sync_put(post: &MapkyAppPost, user_id: &str, post_id: &str) -> Resu
         .await?;
 
     // 2. Ensure Place node exists — skip Nominatim if the Place is already indexed
-    let osm_type = post.place.osm_type.to_string();
-    let osm_id = post.place.osm_id;
-    let osm_canonical = format!("{osm_type}/{osm_id}");
+    let osm_canonical = crate::models::place::osm_canonical_from_url(&post.place);
 
     let already_exists: bool = {
         let mut stream = graph
@@ -40,7 +38,7 @@ pub async fn sync_put(post: &MapkyAppPost, user_id: &str, post_id: &str) -> Resu
     };
 
     if !already_exists {
-        let place = PlaceDetails::from_osm_ref(&post.place).await;
+        let place = PlaceDetails::from_osm_url(&post.place).await;
         graph.run(queries::put::create_place(&place)).await?;
     }
 

@@ -31,11 +31,12 @@ All models are defined in [`mapky-app-specs`](https://github.com/gillohner/mapky
 | Model | Path | Indexed |
 |---|---|---|
 | `MapkyAppPost` | `/pub/mapky.app/posts/<id>` | Yes — nodes, edges, rating aggregates |
-| `MapkyAppLocationTag` | `/pub/mapky.app/location_tags/<id>` | Stub (v1) |
 | `MapkyAppCollection` | `/pub/mapky.app/collections/<id>` | Stub (v1) |
 | `MapkyAppIncident` | `/pub/mapky.app/incidents/<id>` | Stub (v1) |
 | `MapkyAppGeoCapture` | `/pub/mapky.app/geo_captures/<id>` | Stub (v1) |
 | `MapkyAppRoute` | `/pub/mapky.app/routes/<id>` | Stub (v1) |
+
+Tags on places use standard `PubkyAppTag` (universal tags) stored at `/pub/mapky.app/tags/`, indexed by pubky-nexus as generic Resource nodes.
 
 ### Neo4j Graph Schema
 

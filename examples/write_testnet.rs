@@ -30,7 +30,7 @@
 //! ```
 
 use mapky_app_specs::traits::{HasIdPath, TimestampId};
-use mapky_app_specs::{MapkyAppPost, MapkyAppPostKind, OsmElementType, OsmRef};
+use mapky_app_specs::{MapkyAppPost, MapkyAppPostKind};
 use pubky::{Keypair, PubkyHttpClient, PublicKey};
 use pubky_app_specs::traits::HashId;
 use pubky_app_specs::PubkyAppTag;
@@ -39,43 +39,43 @@ use pubky_app_specs::PubkyAppTag;
 /// Must match the instance you're running.
 const HOMESERVER_PK: &str = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo";
 
-fn test_posts() -> Vec<(OsmRef, &'static str, Option<u8>)> {
+fn test_posts() -> Vec<(&'static str, &'static str, Option<u8>)> {
     vec![
         // Luzern — Hafenbar zur Metzgerhalle (node/1573053883)
         (
-            OsmRef::new(OsmElementType::Node, 1573053883),
+            "https://www.openstreetmap.org/node/1573053883",
             "Great Bitcoin bar in Luzern. Lightning payments work perfectly, friendly staff.",
             Some(9),
         ),
         (
-            OsmRef::new(OsmElementType::Node, 1573053883),
+            "https://www.openstreetmap.org/node/1573053883",
             "Nice vibe and good beer selection. A bit loud on Friday nights but worth it.",
             Some(7),
         ),
         (
-            OsmRef::new(OsmElementType::Node, 1573053883),
+            "https://www.openstreetmap.org/node/1573053883",
             "Does the kitchen serve food or just drinks?",
             None,
         ),
         // Mossel Bay — Bitcoin Ekasi Center (way/618456759)
         (
-            OsmRef::new(OsmElementType::Way, 618456759),
+            "https://www.openstreetmap.org/way/618456759",
             "Incredible community work. Teaching Bitcoin to kids in Mossel Bay — genuinely inspiring.",
             Some(10),
         ),
         (
-            OsmRef::new(OsmElementType::Way, 618456759),
+            "https://www.openstreetmap.org/way/618456759",
             "Visited during a trip along the Garden Route. The team here is doing amazing work.",
             Some(9),
         ),
         // Zürich — Insider restaurant (node/3646146894)
         (
-            OsmRef::new(OsmElementType::Node, 3646146894),
+            "https://www.openstreetmap.org/node/3646146894",
             "Solid lunch spot. Great value, fast service, and the daily specials are always good.",
             Some(8),
         ),
         (
-            OsmRef::new(OsmElementType::Node, 3646146894),
+            "https://www.openstreetmap.org/node/3646146894",
             "Are you open on Saturdays? The OSM hours say closed but the website says otherwise.",
             None,
         ),
@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     // Track (author_pk, post_id) so we can tag them afterwards.
     let mut written_posts: Vec<(String, String)> = Vec::new();
-    for (i, (place, content, rating)) in posts.iter().enumerate() {
+    for (i, (place_url, content, rating)) in posts.iter().enumerate() {
         let (ref user_pk, ref session) = sessions[i % sessions.len()];
 
         let kind = if rating.is_some() {
@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let post = MapkyAppPost::new(
             kind,
-            place.clone(),
+            place_url.to_string(),
             Some(content.to_string()),
             *rating,
             None,

@@ -22,7 +22,7 @@ impl PostDetails {
         Self {
             id: format!("{user_id}:{post_id}"),
             author_id: user_id.to_string(),
-            osm_canonical: post.place.canonical(),
+            osm_canonical: crate::models::place::osm_canonical_from_url(&post.place),
             content: post.content.clone(),
             rating: post.rating,
             kind: match post.kind {

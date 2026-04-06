@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 nexus-common = { path = "../../pubky-nexus/nexus-common" }
 mapky-app-specs = { path = "../mapky-app-specs" }
+pubky-app-specs = { path = "../../pubky-app-specs" }
 async-trait = "0.1.89"
 axum = "0.8.8"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }

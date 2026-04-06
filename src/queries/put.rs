@@ -3,8 +3,12 @@
 //! Uses `:MapkyAppPost` label to avoid collision with nexus's existing `:Post` label.
 //! Post identity follows the same compound-key convention as nexus: `author_id:post_id`.
 
+use crate::models::collection::CollectionDetails;
+use crate::models::geo_capture::GeoCaptureDetails;
+use crate::models::incident::IncidentDetails;
 use crate::models::place::PlaceDetails;
 use crate::models::post::PostDetails;
+use crate::models::route::RouteDetails;
 use nexus_common::db::graph::Query;
 
 /// Create or update a User node (minimal — no profile data from post events).
@@ -99,6 +103,30 @@ pub fn increment_place_rating(osm_canonical: &str, rating: u8) -> Query {
     .param("rating", rating as i64)
 }
 
+/// Create a TAGGED relationship from a User to a Place, and increment tag_count.
+pub fn create_place_tag(
+    tagger_user_id: &str,
+    osm_canonical: &str,
+    tag_id: &str,
+    label: &str,
+    indexed_at: i64,
+) -> Query {
+    Query::new(
+        "mapky_create_place_tag",
+        "MATCH (user:User {id: $user_id})
+         MATCH (place:Place {osm_canonical: $osm_canonical})
+         MERGE (user)-[t:TAGGED {label: $label}]->(place)
+         ON CREATE SET t.indexed_at = $indexed_at,
+                       t.id = $tag_id,
+                       place.tag_count = place.tag_count + 1",
+    )
+    .param("user_id", tagger_user_id)
+    .param("osm_canonical", osm_canonical)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("indexed_at", indexed_at)
+}
+
 /// Roll back the running average rating after a review is deleted.
 pub fn decrement_place_rating(osm_canonical: &str, rating: u8) -> Query {
     Query::new(
@@ -113,4 +141,166 @@ pub fn decrement_place_rating(osm_canonical: &str, rating: u8) -> Query {
     )
     .param("osm_canonical", osm_canonical)
     .param("rating", rating as i64)
+}
+
+// ── Incident ────────────────────────────────────────────────────────────
+
+/// MERGE a MapkyAppIncident node with spatial point and REPORTED edge.
+pub fn create_incident(incident: &IncidentDetails) -> Query {
+    Query::new(
+        "mapky_create_incident",
+        "MATCH (author:User {id: $author_id})
+         MERGE (author)-[:REPORTED]->(i:MapkyAppIncident {id: $id})
+         ON CREATE SET i.indexed_at = $indexed_at
+         SET i.incident_type = $incident_type,
+             i.severity = $severity,
+             i.location = point({latitude: $lat, longitude: $lon}),
+             i.lat = $lat,
+             i.lon = $lon,
+             i.heading = $heading,
+             i.description = $description,
+             i.attachments = $attachments,
+             i.expires_at = $expires_at",
+    )
+    .param("author_id", incident.author_id.clone())
+    .param("id", incident.id.clone())
+    .param("incident_type", incident.incident_type.clone())
+    .param("severity", incident.severity.clone())
+    .param("lat", incident.lat)
+    .param("lon", incident.lon)
+    .param("heading", incident.heading)
+    .param("description", incident.description.clone())
+    .param("attachments", incident.attachments.clone())
+    .param("expires_at", incident.expires_at)
+    .param("indexed_at", incident.indexed_at)
+}
+
+// ── GeoCapture ──────────────────────────────────────────────────────────
+
+/// MERGE a MapkyAppGeoCapture node with spatial point and CAPTURED edge.
+pub fn create_geo_capture(capture: &GeoCaptureDetails) -> Query {
+    Query::new(
+        "mapky_create_geo_capture",
+        "MATCH (author:User {id: $author_id})
+         MERGE (author)-[:CAPTURED]->(g:MapkyAppGeoCapture {id: $id})
+         ON CREATE SET g.indexed_at = $indexed_at
+         SET g.file_uri = $file_uri,
+             g.kind = $kind,
+             g.location = point({latitude: $lat, longitude: $lon}),
+             g.lat = $lat,
+             g.lon = $lon,
+             g.ele = $ele,
+             g.heading = $heading,
+             g.pitch = $pitch,
+             g.fov = $fov,
+             g.caption = $caption,
+             g.sequence_uri = $sequence_uri,
+             g.sequence_index = $sequence_index",
+    )
+    .param("author_id", capture.author_id.clone())
+    .param("id", capture.id.clone())
+    .param("file_uri", capture.file_uri.clone())
+    .param("kind", capture.kind.clone())
+    .param("lat", capture.lat)
+    .param("lon", capture.lon)
+    .param("ele", capture.ele)
+    .param("heading", capture.heading)
+    .param("pitch", capture.pitch)
+    .param("fov", capture.fov)
+    .param("caption", capture.caption.clone())
+    .param("sequence_uri", capture.sequence_uri.clone())
+    .param("sequence_index", capture.sequence_index)
+    .param("indexed_at", capture.indexed_at)
+}
+
+// ── Collection ──────────────────────────────────────────────────────────
+
+/// MERGE a MapkyAppCollection node with CREATED edge.
+pub fn create_collection(collection: &CollectionDetails) -> Query {
+    Query::new(
+        "mapky_create_collection",
+        "MATCH (author:User {id: $author_id})
+         MERGE (author)-[:CREATED]->(c:MapkyAppCollection {id: $id})
+         ON CREATE SET c.indexed_at = $indexed_at
+         SET c.name = $name,
+             c.description = $description,
+             c.image_uri = $image_uri",
+    )
+    .param("author_id", collection.author_id.clone())
+    .param("id", collection.id.clone())
+    .param("name", collection.name.clone())
+    .param("description", collection.description.clone())
+    .param("image_uri", collection.image_uri.clone())
+    .param("indexed_at", collection.indexed_at)
+}
+
+/// MERGE a CONTAINS edge from a Collection to a Place.
+pub fn link_collection_place(collection_id: &str, osm_canonical: &str) -> Query {
+    Query::new(
+        "mapky_link_collection_place",
+        "MATCH (c:MapkyAppCollection {id: $collection_id})
+         MATCH (p:Place {osm_canonical: $osm_canonical})
+         MERGE (c)-[:CONTAINS]->(p)",
+    )
+    .param("collection_id", collection_id)
+    .param("osm_canonical", osm_canonical)
+}
+
+/// Remove CONTAINS edges to Places no longer in the collection's items list.
+pub fn cleanup_collection_places(collection_id: &str, current_canonicals: &[String]) -> Query {
+    Query::new(
+        "mapky_cleanup_collection_places",
+        "MATCH (c:MapkyAppCollection {id: $collection_id})-[r:CONTAINS]->(p:Place)
+         WHERE NOT p.osm_canonical IN $current_canonicals
+         DELETE r",
+    )
+    .param("collection_id", collection_id)
+    .param("current_canonicals", current_canonicals.to_vec())
+}
+
+// ── Route ───────────────────────────────────────────────────────────────
+
+/// MERGE a MapkyAppRoute node with bounding box and CREATED edge.
+/// Full waypoint data stays on the homeserver — only metadata is indexed.
+pub fn create_route(route: &RouteDetails) -> Query {
+    Query::new(
+        "mapky_create_route",
+        "MATCH (author:User {id: $author_id})
+         MERGE (author)-[:CREATED]->(r:MapkyAppRoute {id: $id})
+         ON CREATE SET r.indexed_at = $indexed_at
+         SET r.name = $name,
+             r.description = $description,
+             r.activity = $activity,
+             r.difficulty = $difficulty,
+             r.distance_m = $distance_m,
+             r.elevation_gain_m = $elevation_gain_m,
+             r.elevation_loss_m = $elevation_loss_m,
+             r.estimated_duration_s = $estimated_duration_s,
+             r.image_uri = $image_uri,
+             r.start_point = point({latitude: $start_lat, longitude: $start_lon}),
+             r.min_lat = $min_lat,
+             r.min_lon = $min_lon,
+             r.max_lat = $max_lat,
+             r.max_lon = $max_lon,
+             r.waypoint_count = $waypoint_count",
+    )
+    .param("author_id", route.author_id.clone())
+    .param("id", route.id.clone())
+    .param("name", route.name.clone())
+    .param("description", route.description.clone())
+    .param("activity", route.activity.clone())
+    .param("difficulty", route.difficulty.clone())
+    .param("distance_m", route.distance_m)
+    .param("elevation_gain_m", route.elevation_gain_m)
+    .param("elevation_loss_m", route.elevation_loss_m)
+    .param("estimated_duration_s", route.estimated_duration_s)
+    .param("image_uri", route.image_uri.clone())
+    .param("start_lat", route.start_lat)
+    .param("start_lon", route.start_lon)
+    .param("min_lat", route.min_lat)
+    .param("min_lon", route.min_lon)
+    .param("max_lat", route.max_lat)
+    .param("max_lon", route.max_lon)
+    .param("waypoint_count", route.waypoint_count)
+    .param("indexed_at", route.indexed_at)
 }

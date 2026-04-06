@@ -33,7 +33,7 @@ impl Default for MapkyPlugin {
 }
 
 /// Split `/pub/mapky.app/posts/0034TK01CC73G` into `("posts", "0034TK01CC73G")`.
-fn split_resource(path: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_resource(path: &str) -> Option<(&str, &str)> {
     let after_app = path.strip_prefix("/pub/mapky.app/")?;
     let slash = after_app.find('/')?;
     let resource_type = &after_app[..slash];  // e.g. "posts"
@@ -45,7 +45,7 @@ fn split_resource(path: &str) -> Option<(&str, &str)> {
 }
 
 /// Extract `/pub/mapky.app/...` from `pubky://{user_id}/pub/mapky.app/...`.
-fn extract_pub_path(uri: &str) -> Option<&str> {
+pub(crate) fn extract_pub_path(uri: &str) -> Option<&str> {
     let without_scheme = uri.strip_prefix("pubky://")?;
     let slash = without_scheme.find('/')?;
     let path = &without_scheme[slash..];
@@ -54,6 +54,13 @@ fn extract_pub_path(uri: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Extract `user_id` from `pubky://{user_id}/pub/...`.
+pub(crate) fn extract_user_id(uri: &str) -> Option<&str> {
+    let without_scheme = uri.strip_prefix("pubky://")?;
+    let slash = without_scheme.find('/')?;
+    Some(&without_scheme[..slash])
 }
 
 #[async_trait::async_trait]
@@ -77,27 +84,44 @@ impl NexusPlugin for MapkyPlugin {
         let (resource_type, resource_id) = split_resource(path)
             .ok_or_else(|| format!("Cannot split resource from path: {path}"))?;
 
-        let object = MapkyAppObject::from_path(resource_type, data, resource_id)
-            .map_err(|e| format!("Failed to parse {uri}: {e}"))?;
+        // Infrastructure types — handle before MapkyAppObject dispatch.
+        match resource_type {
+            "tags" => {
+                handlers::tag::sync_put(data, user_id, resource_id).await?;
+                return Ok(());
+            }
+            "files" => {
+                handlers::file::sync_put(data, uri, user_id).await?;
+                return Ok(());
+            }
+            "blobs" => return Ok(()), // raw binary, fetched on-demand via file.src
+            _ => {}
+        }
+
+        // Skip unrecognized resource types.
+        let object = match MapkyAppObject::from_path(resource_type, data, resource_id) {
+            Ok(obj) => obj,
+            Err(_) => {
+                debug!("Skipping unrecognized resource type '{resource_type}' at {uri}");
+                return Ok(());
+            }
+        };
 
         match object {
             MapkyAppObject::Post(post) => {
                 handlers::post::sync_put(&post, user_id, resource_id).await?;
             }
-            MapkyAppObject::LocationTag(_) => {
-                debug!("LocationTag handler not yet implemented, skipping {uri}");
+            MapkyAppObject::Collection(collection) => {
+                handlers::collection::sync_put(&collection, user_id, resource_id).await?;
             }
-            MapkyAppObject::Collection(_) => {
-                debug!("Collection handler not yet implemented, skipping {uri}");
+            MapkyAppObject::Incident(incident) => {
+                handlers::incident::sync_put(&incident, user_id, resource_id).await?;
             }
-            MapkyAppObject::Incident(_) => {
-                debug!("Incident handler not yet implemented, skipping {uri}");
+            MapkyAppObject::GeoCapture(geo_capture) => {
+                handlers::geo_capture::sync_put(&geo_capture, user_id, resource_id).await?;
             }
-            MapkyAppObject::GeoCapture(_) => {
-                debug!("GeoCapture handler not yet implemented, skipping {uri}");
-            }
-            MapkyAppObject::Route(_) => {
-                debug!("Route handler not yet implemented, skipping {uri}");
+            MapkyAppObject::Route(route) => {
+                handlers::route::sync_put(&route, user_id, resource_id).await?;
             }
         }
 
@@ -116,11 +140,30 @@ impl NexusPlugin for MapkyPlugin {
             .ok_or_else(|| format!("Cannot split resource from path: {path}"))?;
 
         match resource_type {
+            "tags" => {
+                handlers::tag::del(user_id, resource_id).await?;
+            }
+            "files" => {
+                handlers::file::del(uri, user_id).await?;
+            }
+            "blobs" => {} // raw binary, not indexed
             "posts" => {
                 handlers::post::del(user_id, resource_id).await?;
             }
-            other => {
-                debug!("DEL handler for '{other}' not yet implemented, skipping {uri}");
+            "incidents" => {
+                handlers::incident::del(user_id, resource_id).await?;
+            }
+            "geo_captures" => {
+                handlers::geo_capture::del(user_id, resource_id).await?;
+            }
+            "collections" => {
+                handlers::collection::del(user_id, resource_id).await?;
+            }
+            "routes" => {
+                handlers::route::del(user_id, resource_id).await?;
+            }
+            _ => {
+                debug!("Skipping DEL for '{resource_type}' at {uri}");
             }
         }
 
@@ -142,28 +185,48 @@ impl NexusPlugin for MapkyPlugin {
         uri_owner_id: &str,
         _ctx: &PluginContext,
     ) -> Result<Option<GraphNodeRef>, DynError> {
-        match resource_type {
-            "posts" => {
-                let compound_id = format!("{uri_owner_id}:{resource_id}");
-                let graph = get_neo4j_graph()?;
-                let query = crate::queries::get::mapky_post_exists(&compound_id);
-                let mut stream = graph.execute(query).await?;
-                let exists: bool = stream
-                    .try_next()
-                    .await?
-                    .and_then(|row| row.get("exists").ok())
-                    .unwrap_or(false);
-                if exists {
-                    Ok(Some(GraphNodeRef {
-                        label: "MapkyAppPost".to_string(),
-                        property: "id".to_string(),
-                        id: compound_id,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
+        let compound_id = format!("{uri_owner_id}:{resource_id}");
+        let graph = get_neo4j_graph()?;
+
+        let (label, query) = match resource_type {
+            "posts" => (
+                "MapkyAppPost",
+                queries::get::mapky_post_exists(&compound_id),
+            ),
+            "incidents" => (
+                "MapkyAppIncident",
+                queries::get::mapky_incident_exists(&compound_id),
+            ),
+            "geo_captures" => (
+                "MapkyAppGeoCapture",
+                queries::get::mapky_geo_capture_exists(&compound_id),
+            ),
+            "collections" => (
+                "MapkyAppCollection",
+                queries::get::mapky_collection_exists(&compound_id),
+            ),
+            "routes" => (
+                "MapkyAppRoute",
+                queries::get::mapky_route_exists(&compound_id),
+            ),
+            _ => return Ok(None),
+        };
+
+        let mut stream = graph.execute(query).await?;
+        let exists: bool = stream
+            .try_next()
+            .await?
+            .and_then(|row| row.get("exists").ok())
+            .unwrap_or(false);
+
+        if exists {
+            Ok(Some(GraphNodeRef {
+                label: label.to_string(),
+                property: "id".to_string(),
+                id: compound_id,
+            }))
+        } else {
+            Ok(None)
         }
     }
 
@@ -171,7 +234,7 @@ impl NexusPlugin for MapkyPlugin {
         let graph = get_neo4j_graph()?;
 
         let ddl_statements: &[(&str, &str)] = &[
-            // Spatial index on Place.location — required for viewport bbox queries
+            // ── Place ──
             (
                 "mapky_schema_place_unique",
                 "CREATE CONSTRAINT mapky_place_unique IF NOT EXISTS \
@@ -182,11 +245,50 @@ impl NexusPlugin for MapkyPlugin {
                 "CREATE POINT INDEX mapky_place_location IF NOT EXISTS \
                  FOR (p:Place) ON (p.location)",
             ),
-            // MapkyAppPost uniqueness constraint — id is the compound key author_id:post_id
+            // ── MapkyAppPost ──
             (
                 "mapky_schema_post_unique",
                 "CREATE CONSTRAINT mapky_post_unique IF NOT EXISTS \
                  FOR (p:MapkyAppPost) REQUIRE p.id IS UNIQUE",
+            ),
+            // ── MapkyAppIncident ──
+            (
+                "mapky_schema_incident_unique",
+                "CREATE CONSTRAINT mapky_incident_unique IF NOT EXISTS \
+                 FOR (i:MapkyAppIncident) REQUIRE i.id IS UNIQUE",
+            ),
+            (
+                "mapky_schema_incident_location",
+                "CREATE POINT INDEX mapky_incident_location IF NOT EXISTS \
+                 FOR (i:MapkyAppIncident) ON (i.location)",
+            ),
+            // ── MapkyAppGeoCapture ──
+            (
+                "mapky_schema_geo_capture_unique",
+                "CREATE CONSTRAINT mapky_geo_capture_unique IF NOT EXISTS \
+                 FOR (g:MapkyAppGeoCapture) REQUIRE g.id IS UNIQUE",
+            ),
+            (
+                "mapky_schema_geo_capture_location",
+                "CREATE POINT INDEX mapky_geo_capture_location IF NOT EXISTS \
+                 FOR (g:MapkyAppGeoCapture) ON (g.location)",
+            ),
+            // ── MapkyAppCollection ──
+            (
+                "mapky_schema_collection_unique",
+                "CREATE CONSTRAINT mapky_collection_unique IF NOT EXISTS \
+                 FOR (c:MapkyAppCollection) REQUIRE c.id IS UNIQUE",
+            ),
+            // ── MapkyAppRoute ──
+            (
+                "mapky_schema_route_unique",
+                "CREATE CONSTRAINT mapky_route_unique IF NOT EXISTS \
+                 FOR (r:MapkyAppRoute) REQUIRE r.id IS UNIQUE",
+            ),
+            (
+                "mapky_schema_route_start",
+                "CREATE POINT INDEX mapky_route_start IF NOT EXISTS \
+                 FOR (r:MapkyAppRoute) ON (r.start_point)",
             ),
         ];
 

@@ -4,7 +4,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use mapky_app_specs::OsmRef;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -74,11 +73,11 @@ impl PlaceDetails {
 
     /// Resolve OSM coordinates via Nominatim (rate-limited to 1 req/s).
     ///
+    /// `osm_url` is an OpenStreetMap URL like `https://www.openstreetmap.org/node/123`.
     /// On failure the place is stored at (0, 0) with `geocoded: false` so it
     /// can be identified and backfilled later.
-    pub async fn from_osm_ref(osm_ref: &OsmRef) -> Self {
-        let osm_type = osm_ref.osm_type.to_string();
-        let osm_id = osm_ref.osm_id;
+    pub async fn from_osm_url(osm_url: &str) -> Self {
+        let (osm_type, osm_id) = parse_osm_url(osm_url);
 
         match resolve_osm_coords(&osm_type, osm_id).await {
             Some((lat, lon)) => Self::new(&osm_type, osm_id, lat, lon, true),
@@ -91,6 +90,22 @@ impl PlaceDetails {
             }
         }
     }
+}
+
+/// Extract `"node/123"` from `"https://www.openstreetmap.org/node/123"`.
+/// The URL is already validated by mapky-app-specs.
+pub fn osm_canonical_from_url(url: &str) -> String {
+    url.strip_prefix("https://www.openstreetmap.org/")
+        .unwrap_or(url)
+        .to_string()
+}
+
+/// Parse an OSM URL into `(osm_type, osm_id)`.
+/// The URL is already validated by mapky-app-specs.
+pub fn parse_osm_url(url: &str) -> (String, i64) {
+    let canonical = osm_canonical_from_url(url);
+    let (osm_type, osm_id_str) = canonical.split_once('/').expect("validated OSM URL");
+    (osm_type.to_string(), osm_id_str.parse().expect("validated OSM ID"))
 }
 
 #[derive(Debug, Deserialize)]
