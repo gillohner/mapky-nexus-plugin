@@ -3,7 +3,7 @@
 //!
 //! Inspects `tag.uri` to determine the target:
 //! - OSM URL → `(User)-[:TAGGED]->(Place)` + increment `tag_count`
-//! - Mapky resource URI → `(User)-[:TAGGED]->(MapkyApp*)` via `create_external_tag`
+//! - Mapky resource URI → `(User)-[:TAGGED]->(MapkyApp*)` via plugin-local query
 
 use chrono::Utc;
 use futures::TryStreamExt;
@@ -103,11 +103,10 @@ pub async fn sync_put(data: &[u8], tagger_user_id: &str, tag_id: &str) -> Result
             .run(queries::put::create_user(tagger_user_id, indexed_at))
             .await?;
 
-        // Reuse nexus-common's create_external_tag query.
-        let query = nexus_common::db::graph::queries::put::create_external_tag(
+        // Create TAGGED relationship from user to the mapky resource node.
+        let query = queries::put::create_resource_tag(
             tagger_user_id,
             node_label,
-            "id",
             &compound_id,
             tag_id,
             &tag.label,

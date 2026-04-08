@@ -304,3 +304,32 @@ pub fn create_route(route: &RouteDetails) -> Query {
     .param("waypoint_count", route.waypoint_count)
     .param("indexed_at", route.indexed_at)
 }
+
+/// Create a TAGGED relationship from a user to a mapky resource node.
+///
+/// `node_label` and `node_property` come from plugin code (not user input),
+/// so interpolating them into the query string is safe.
+pub fn create_resource_tag(
+    tagger_user_id: &str,
+    node_label: &str,
+    node_id: &str,
+    tag_id: &str,
+    label: &str,
+    indexed_at: i64,
+) -> Query {
+    let cypher = format!(
+        "MATCH (user:User {{id: $user_id}})
+         MATCH (target:{node_label} {{id: $target_id}})
+         OPTIONAL MATCH (user)-[existing:TAGGED {{label: $label}}]->(target)
+         MERGE (user)-[t:TAGGED {{label: $label}}]->(target)
+         ON CREATE SET t.indexed_at = $indexed_at,
+                       t.id = $tag_id
+         RETURN existing IS NOT NULL AS flag"
+    );
+    Query::new("mapky_create_resource_tag", &cypher)
+        .param("user_id", tagger_user_id)
+        .param("target_id", node_id)
+        .param("tag_id", tag_id)
+        .param("label", label)
+        .param("indexed_at", indexed_at)
+}

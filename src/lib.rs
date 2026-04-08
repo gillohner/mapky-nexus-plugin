@@ -10,11 +10,10 @@ pub mod models;
 pub mod queries;
 
 use axum::Router;
-use futures::TryStreamExt;
 use mapky_app_specs::MapkyAppObject;
 use utoipa::OpenApi;
 use nexus_common::db::get_neo4j_graph;
-use nexus_common::plugin::{GraphNodeRef, NexusPlugin, PluginContext, PluginManifest};
+use nexus_common::plugin::{NexusPlugin, PluginContext, PluginManifest};
 use nexus_common::types::DynError;
 use tracing::{debug, warn};
 
@@ -90,11 +89,8 @@ impl NexusPlugin for MapkyPlugin {
                 handlers::tag::sync_put(data, user_id, resource_id).await?;
                 return Ok(());
             }
-            "files" => {
-                handlers::file::sync_put(data, uri, user_id).await?;
-                return Ok(());
-            }
-            "blobs" => return Ok(()), // raw binary, fetched on-demand via file.src
+            // files and blobs are handled by nexus core's universal file handler
+            "files" | "blobs" => return Ok(()),
             _ => {}
         }
 
@@ -143,10 +139,8 @@ impl NexusPlugin for MapkyPlugin {
             "tags" => {
                 handlers::tag::del(user_id, resource_id).await?;
             }
-            "files" => {
-                handlers::file::del(uri, user_id).await?;
-            }
-            "blobs" => {} // raw binary, not indexed
+            // files and blobs are handled by nexus core's universal file handler
+            "files" | "blobs" => {}
             "posts" => {
                 handlers::post::del(user_id, resource_id).await?;
             }
@@ -176,58 +170,6 @@ impl NexusPlugin for MapkyPlugin {
 
     fn openapi_docs(&self) -> Option<utoipa::openapi::OpenApi> {
         Some(api::MapkyApiDoc::openapi())
-    }
-
-    async fn resolve_graph_node(
-        &self,
-        resource_type: &str,
-        resource_id: &str,
-        uri_owner_id: &str,
-        _ctx: &PluginContext,
-    ) -> Result<Option<GraphNodeRef>, DynError> {
-        let compound_id = format!("{uri_owner_id}:{resource_id}");
-        let graph = get_neo4j_graph()?;
-
-        let (label, query) = match resource_type {
-            "posts" => (
-                "MapkyAppPost",
-                queries::get::mapky_post_exists(&compound_id),
-            ),
-            "incidents" => (
-                "MapkyAppIncident",
-                queries::get::mapky_incident_exists(&compound_id),
-            ),
-            "geo_captures" => (
-                "MapkyAppGeoCapture",
-                queries::get::mapky_geo_capture_exists(&compound_id),
-            ),
-            "collections" => (
-                "MapkyAppCollection",
-                queries::get::mapky_collection_exists(&compound_id),
-            ),
-            "routes" => (
-                "MapkyAppRoute",
-                queries::get::mapky_route_exists(&compound_id),
-            ),
-            _ => return Ok(None),
-        };
-
-        let mut stream = graph.execute(query).await?;
-        let exists: bool = stream
-            .try_next()
-            .await?
-            .and_then(|row| row.get("exists").ok())
-            .unwrap_or(false);
-
-        if exists {
-            Ok(Some(GraphNodeRef {
-                label: label.to_string(),
-                property: "id".to_string(),
-                id: compound_id,
-            }))
-        } else {
-            Ok(None)
-        }
     }
 
     async fn setup_schema(&self, _ctx: &PluginContext) -> Result<(), DynError> {
