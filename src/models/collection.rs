@@ -14,6 +14,7 @@ pub struct CollectionDetails {
     pub description: Option<String>,
     pub items: Vec<String>, // OSM URLs from the spec
     pub image_uri: Option<String>,
+    pub color: Option<String>,
     pub indexed_at: i64,
 }
 
@@ -30,6 +31,7 @@ impl CollectionDetails {
             description: collection.description.clone(),
             items: collection.items.clone(),
             image_uri: collection.image_uri.clone(),
+            color: collection.color.clone(),
             indexed_at: Utc::now().timestamp_millis(),
         }
     }

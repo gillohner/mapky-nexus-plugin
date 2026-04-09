@@ -348,6 +348,7 @@ pub fn get_collection_by_id(compound_id: &str) -> Query {
                 c.description AS description,
                 items,
                 c.image_uri AS image_uri,
+                c.color AS color,
                 c.indexed_at AS indexed_at",
     )
     .param("id", compound_id)
@@ -366,6 +367,7 @@ pub fn get_user_collections(user_id: &str, skip: i64, limit: i64) -> Query {
                 c.description AS description,
                 items,
                 c.image_uri AS image_uri,
+                c.color AS color,
                 c.indexed_at AS indexed_at
          ORDER BY c.indexed_at DESC
          SKIP $skip LIMIT $limit",
@@ -388,6 +390,7 @@ pub fn get_collections_containing_place(osm_canonical: &str) -> Query {
                 c.description AS description,
                 items,
                 c.image_uri AS image_uri,
+                c.color AS color,
                 c.indexed_at AS indexed_at
          ORDER BY c.indexed_at DESC",
     )
@@ -560,6 +563,7 @@ pub fn search_collections_by_tag(query_str: &str, limit: i64) -> Query {
                 c.description AS description,
                 items,
                 c.image_uri AS image_uri,
+                c.color AS color,
                 c.indexed_at AS indexed_at",
     )
     .param("query", query_str)

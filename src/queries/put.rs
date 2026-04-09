@@ -224,13 +224,15 @@ pub fn create_collection(collection: &CollectionDetails) -> Query {
          ON CREATE SET c.indexed_at = $indexed_at
          SET c.name = $name,
              c.description = $description,
-             c.image_uri = $image_uri",
+             c.image_uri = $image_uri,
+             c.color = $color",
     )
     .param("author_id", collection.author_id.clone())
     .param("id", collection.id.clone())
     .param("name", collection.name.clone())
     .param("description", collection.description.clone())
     .param("image_uri", collection.image_uri.clone())
+    .param("color", collection.color.clone())
     .param("indexed_at", collection.indexed_at)
 }
 

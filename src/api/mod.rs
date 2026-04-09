@@ -864,6 +864,7 @@ async fn collection_detail(
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
             image_uri: row.get("image_uri").ok(),
+            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         })),
         None => Err((
@@ -914,6 +915,7 @@ async fn user_collections(
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
             image_uri: row.get("image_uri").ok(),
+            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
@@ -955,6 +957,7 @@ async fn collections_for_place(
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
             image_uri: row.get("image_uri").ok(),
+            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
@@ -1239,6 +1242,7 @@ async fn search_tags(
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
             image_uri: row.get("image_uri").ok(),
+            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
