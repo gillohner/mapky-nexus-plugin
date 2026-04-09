@@ -341,7 +341,7 @@ pub fn get_collection_by_id(compound_id: &str) -> Query {
         "mapky_get_collection",
         "MATCH (u:User)-[:CREATED]->(c:MapkyAppCollection {id: $id})
          OPTIONAL MATCH (c)-[:CONTAINS]->(p:Place)
-         WITH u, c, collect(p.osm_canonical) AS items
+         WITH u, c, collect('https://www.openstreetmap.org/' + p.osm_canonical) AS items
          RETURN c.id AS id,
                 u.id AS author_id,
                 c.name AS name,
@@ -359,7 +359,7 @@ pub fn get_user_collections(user_id: &str, skip: i64, limit: i64) -> Query {
         "mapky_user_collections",
         "MATCH (u:User {id: $user_id})-[:CREATED]->(c:MapkyAppCollection)
          OPTIONAL MATCH (c)-[:CONTAINS]->(p:Place)
-         WITH u, c, collect(p.osm_canonical) AS items
+         WITH u, c, collect('https://www.openstreetmap.org/' + p.osm_canonical) AS items
          RETURN c.id AS id,
                 u.id AS author_id,
                 c.name AS name,
@@ -381,7 +381,7 @@ pub fn get_collections_containing_place(osm_canonical: &str) -> Query {
         "mapky_collections_for_place",
         "MATCH (u:User)-[:CREATED]->(c:MapkyAppCollection)-[:CONTAINS]->(p:Place {osm_canonical: $osm_canonical})
          OPTIONAL MATCH (c)-[:CONTAINS]->(all_p:Place)
-         WITH u, c, collect(all_p.osm_canonical) AS items
+         WITH u, c, collect('https://www.openstreetmap.org/' + all_p.osm_canonical) AS items
          RETURN c.id AS id,
                 u.id AS author_id,
                 c.name AS name,
@@ -392,6 +392,17 @@ pub fn get_collections_containing_place(osm_canonical: &str) -> Query {
          ORDER BY c.indexed_at DESC",
     )
     .param("osm_canonical", osm_canonical)
+}
+
+/// Fetch tags on a collection, aggregated by label.
+pub fn get_tags_for_collection(compound_id: &str) -> Query {
+    Query::new(
+        "mapky_collection_tags",
+        "MATCH (c:MapkyAppCollection {id: $id})
+         OPTIONAL MATCH (tagger:User)-[tag:TAGGED]->(c)
+         RETURN true AS exists, tag.label AS label, tagger.id AS tagger_id",
+    )
+    .param("id", compound_id)
 }
 
 /// Check if a MapkyAppCollection exists (for resolve_graph_node).
@@ -502,6 +513,81 @@ pub fn mapky_route_exists(compound_id: &str) -> Query {
         "MATCH (r:MapkyAppRoute {id: $id}) RETURN count(r) > 0 AS exists",
     )
     .param("id", compound_id)
+}
+
+// ── Tag search queries ─────────────────────────────────────────────────
+
+/// Search for Places tagged with a label that contains the query string.
+pub fn search_places_by_tag(query_str: &str, limit: i64) -> Query {
+    Query::new(
+        "mapky_search_places_by_tag",
+        "MATCH (tagger:User)-[t:TAGGED]->(p:Place)
+         WHERE t.label CONTAINS $query
+         WITH p, count(DISTINCT tagger) AS tagger_count
+         ORDER BY tagger_count DESC
+         LIMIT $limit
+         RETURN p.osm_canonical AS osm_canonical,
+                p.osm_type AS osm_type,
+                p.osm_id AS osm_id,
+                p.lat AS lat,
+                p.lon AS lon,
+                p.geocoded AS geocoded,
+                p.review_count AS review_count,
+                p.avg_rating AS avg_rating,
+                p.tag_count AS tag_count,
+                p.photo_count AS photo_count,
+                p.indexed_at AS indexed_at",
+    )
+    .param("query", query_str)
+    .param("limit", limit)
+}
+
+/// Search for Collections tagged with a label that contains the query string.
+pub fn search_collections_by_tag(query_str: &str, limit: i64) -> Query {
+    Query::new(
+        "mapky_search_collections_by_tag",
+        "MATCH (tagger:User)-[t:TAGGED]->(c:MapkyAppCollection)
+         WHERE t.label CONTAINS $query
+         WITH c, count(DISTINCT tagger) AS tagger_count
+         ORDER BY tagger_count DESC
+         LIMIT $limit
+         OPTIONAL MATCH (u:User)-[:CREATED]->(c)
+         OPTIONAL MATCH (c)-[:CONTAINS]->(p:Place)
+         WITH u, c, tagger_count, collect(p.osm_canonical) AS items
+         RETURN c.id AS id,
+                u.id AS author_id,
+                c.name AS name,
+                c.description AS description,
+                items,
+                c.image_uri AS image_uri,
+                c.indexed_at AS indexed_at",
+    )
+    .param("query", query_str)
+    .param("limit", limit)
+}
+
+/// Search for MapkyAppPosts tagged with a label that contains the query string.
+pub fn search_posts_by_tag(query_str: &str, limit: i64) -> Query {
+    Query::new(
+        "mapky_search_posts_by_tag",
+        "MATCH (tagger:User)-[t:TAGGED]->(post:MapkyAppPost)
+         WHERE t.label CONTAINS $query
+         WITH post, count(DISTINCT tagger) AS tagger_count
+         ORDER BY tagger_count DESC
+         LIMIT $limit
+         MATCH (author:User)-[:AUTHORED]->(post)-[:ABOUT]->(place:Place)
+         RETURN post.id AS id,
+                author.id AS author_id,
+                place.osm_canonical AS osm_canonical,
+                post.content AS content,
+                post.rating AS rating,
+                post.kind AS kind,
+                post.parent_uri AS parent_uri,
+                post.attachments AS attachments,
+                post.indexed_at AS indexed_at",
+    )
+    .param("query", query_str)
+    .param("limit", limit)
 }
 
 /// Fetch only review posts (rating > 0) for a place, most recent first.

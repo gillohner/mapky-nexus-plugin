@@ -50,6 +50,10 @@ pub fn routes(ctx: PluginContext) -> Router {
         )
         .route("/collections/user/{user_id}", get(user_collections))
         .route(
+            "/collections/{author_id}/{collection_id}/tags",
+            get(collection_tags),
+        )
+        .route(
             "/collections/place/{osm_type}/{osm_id}",
             get(collections_for_place),
         )
@@ -57,6 +61,8 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/routes/viewport", get(routes_viewport))
         .route("/routes/{author_id}/{route_id}", get(route_detail))
         .route("/routes/user/{user_id}", get(user_routes))
+        // ── Search ──
+        .route("/search/tags", get(search_tags))
         .with_state(ctx)
 }
 
@@ -69,19 +75,22 @@ pub fn routes(ctx: PluginContext) -> Router {
         (name = "GeoCapture", description = "Geo-located captures (photos, audio, video)"),
         (name = "Collection", description = "Curated collections of places"),
         (name = "Route", description = "Routes and trails"),
+        (name = "Search", description = "Cross-resource search"),
     ),
     paths(
         viewport, place_detail, place_posts, place_tags,
         post_tags, user_posts,
         incidents_viewport, incident_detail, user_incidents,
         geo_captures_viewport, geo_capture_detail, user_geo_captures,
-        collection_detail, user_collections, collections_for_place,
+        collection_detail, user_collections, collections_for_place, collection_tags,
         routes_viewport, route_detail, user_routes,
+        search_tags,
     ),
     components(schemas(
         PlaceDetails, PostDetails, PostTagDetails,
         IncidentDetails, GeoCaptureDetails, CollectionDetails, RouteDetails,
         ViewportQuery, PostsQuery, PaginationQuery,
+        TagSearchQuery, TagSearchResponse,
     ))
 )]
 pub struct MapkyApiDoc;
@@ -118,6 +127,24 @@ pub struct PaginationQuery {
 
 fn default_limit() -> i64 {
     100
+}
+
+fn default_tag_search_limit() -> i64 {
+    20
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct TagSearchQuery {
+    pub q: String,
+    #[serde(default = "default_tag_search_limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TagSearchResponse {
+    pub places: Vec<PlaceDetails>,
+    pub collections: Vec<CollectionDetails>,
+    pub posts: Vec<PostDetails>,
 }
 
 /// Strip the `author_id:` prefix from a compound Neo4j post id, returning just the short post_id.
@@ -935,6 +962,70 @@ async fn collections_for_place(
     Ok(Json(collections))
 }
 
+/// Get tags on a collection
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/collections/{author_id}/{collection_id}/tags",
+    tag = "Collection",
+    params(
+        ("author_id" = String, Path, description = "Collection author's pubky ID"),
+        ("collection_id" = String, Path, description = "Collection ID"),
+    ),
+    responses(
+        (status = 200, description = "Tags on the collection", body = Vec<PostTagDetails>),
+        (status = 404, description = "Collection not found", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn collection_tags(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, collection_id)): Path<(String, String)>,
+) -> ApiResult<Vec<PostTagDetails>> {
+    use std::collections::HashMap;
+
+    let compound_id = format!("{author_id}:{collection_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_tags_for_collection(&compound_id))
+        .await
+        .map_err(graph_err)?;
+
+    let mut found = false;
+    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
+
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        found = true;
+        let label: Option<String> = row.get("label").ok();
+        let tagger_id: Option<String> = row.get("tagger_id").ok();
+        if let (Some(l), Some(t)) = (label, tagger_id) {
+            tag_map.entry(l).or_default().push(t);
+        }
+    }
+
+    if !found {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("Collection {compound_id} not found"),
+            }),
+        ));
+    }
+
+    let tags: Vec<PostTagDetails> = tag_map
+        .into_iter()
+        .map(|(label, taggers)| {
+            let taggers_count = taggers.len();
+            PostTagDetails {
+                label,
+                taggers,
+                taggers_count,
+            }
+        })
+        .collect();
+
+    Ok(Json(tags))
+}
+
 // ── Routes ──────────────────────────────────────────────────────────────────
 
 /// List routes whose bounding box overlaps the viewport
@@ -1076,4 +1167,106 @@ fn route_from_row(row: &neo4rs::Row) -> RouteDetails {
         waypoint_count: row.get("waypoint_count").unwrap_or(0),
         indexed_at: row.get("indexed_at").unwrap_or(0),
     }
+}
+
+// ── Search ──────────────────────────────────────────────────────────────────
+
+/// Search places and collections by tag label
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/search/tags",
+    tag = "Search",
+    params(
+        ("q" = String, Query, description = "Tag label substring to search for"),
+        ("limit" = Option<i64>, Query, description = "Max results per type (default 20)")
+    ),
+    responses(
+        (status = 200, description = "Tagged places and collections", body = TagSearchResponse),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn search_tags(
+    State(_ctx): State<PluginContext>,
+    Query(params): Query<TagSearchQuery>,
+) -> ApiResult<TagSearchResponse> {
+    let query_str = params.q.trim().to_lowercase();
+    if query_str.is_empty() {
+        return Ok(Json(TagSearchResponse {
+            places: Vec::new(),
+            collections: Vec::new(),
+            posts: Vec::new(),
+        }));
+    }
+
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+
+    // Search places by tag
+    let mut places = Vec::new();
+    let mut stream = graph
+        .execute(queries::get::search_places_by_tag(&query_str, params.limit))
+        .await
+        .map_err(graph_err)?;
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        places.push(PlaceDetails {
+            osm_canonical: row.get("osm_canonical").unwrap_or_default(),
+            osm_type: row.get("osm_type").unwrap_or_default(),
+            osm_id: row.get("osm_id").unwrap_or(0),
+            lat: row.get("lat").unwrap_or(0.0),
+            lon: row.get("lon").unwrap_or(0.0),
+            geocoded: row.get("geocoded").unwrap_or(false),
+            review_count: row.get("review_count").unwrap_or(0),
+            avg_rating: row.get("avg_rating").unwrap_or(0.0),
+            tag_count: row.get("tag_count").unwrap_or(0),
+            photo_count: row.get("photo_count").unwrap_or(0),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+
+    // Search collections by tag
+    let mut collections = Vec::new();
+    let mut stream = graph
+        .execute(queries::get::search_collections_by_tag(
+            &query_str,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        collections.push(CollectionDetails {
+            id: row.get("id").unwrap_or_default(),
+            author_id: row.get("author_id").unwrap_or_default(),
+            name: row.get("name").unwrap_or_default(),
+            description: row.get("description").ok(),
+            items: row.get::<Vec<String>>("items").unwrap_or_default(),
+            image_uri: row.get("image_uri").ok(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+
+    // Search posts by tag
+    let mut posts = Vec::new();
+    let mut stream = graph
+        .execute(queries::get::search_posts_by_tag(&query_str, params.limit))
+        .await
+        .map_err(graph_err)?;
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        let compound_id: String = row.get("id").unwrap_or_default();
+        posts.push(PostDetails {
+            id: short_post_id(&compound_id),
+            author_id: row.get("author_id").unwrap_or_default(),
+            osm_canonical: row.get("osm_canonical").unwrap_or_default(),
+            content: row.get("content").ok(),
+            rating: row.get::<i64>("rating").ok().map(|r| r as u8),
+            kind: row.get("kind").unwrap_or_default(),
+            parent_uri: row.get("parent_uri").ok(),
+            attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+
+    Ok(Json(TagSearchResponse {
+        places,
+        collections,
+        posts,
+    }))
 }
