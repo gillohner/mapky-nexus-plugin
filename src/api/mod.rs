@@ -19,6 +19,7 @@ use crate::models::incident::IncidentDetails;
 use crate::models::place::PlaceDetails;
 use crate::models::post::PostDetails;
 use crate::models::route::RouteDetails;
+use crate::models::sequence::SequenceDetails;
 use crate::models::tag::PostTagDetails;
 use crate::queries;
 
@@ -42,7 +43,26 @@ pub fn routes(ctx: PluginContext) -> Router {
             "/geo_captures/{author_id}/{capture_id}",
             get(geo_capture_detail),
         )
+        .route(
+            "/geo_captures/{author_id}/{capture_id}/tags",
+            get(geo_capture_tags),
+        )
         .route("/geo_captures/user/{user_id}", get(user_geo_captures))
+        .route("/geo_captures/nearby", get(nearby_geo_captures))
+        // ── Sequence ──
+        .route(
+            "/sequences/{author_id}/{sequence_id}",
+            get(sequence_detail),
+        )
+        .route(
+            "/sequences/{author_id}/{sequence_id}/tags",
+            get(sequence_tags),
+        )
+        .route(
+            "/sequences/{author_id}/{sequence_id}/captures",
+            get(sequence_captures),
+        )
+        .route("/sequences/user/{user_id}", get(user_sequences))
         // ── Collection ──
         .route(
             "/collections/{author_id}/{collection_id}",
@@ -73,6 +93,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         (name = "Post", description = "Posts and reviews on places"),
         (name = "Incident", description = "Geo-located incidents"),
         (name = "GeoCapture", description = "Geo-located captures (photos, audio, video)"),
+        (name = "Sequence", description = "Capture sessions grouping multiple GeoCaptures"),
         (name = "Collection", description = "Curated collections of places"),
         (name = "Route", description = "Routes and trails"),
         (name = "Search", description = "Cross-resource search"),
@@ -81,15 +102,16 @@ pub fn routes(ctx: PluginContext) -> Router {
         viewport, place_detail, place_posts, place_tags,
         post_tags, user_posts,
         incidents_viewport, incident_detail, user_incidents,
-        geo_captures_viewport, geo_capture_detail, user_geo_captures,
+        geo_captures_viewport, geo_capture_detail, geo_capture_tags, user_geo_captures, nearby_geo_captures,
+        sequence_detail, sequence_tags, sequence_captures, user_sequences,
         collection_detail, user_collections, collections_for_place, collection_tags,
         routes_viewport, route_detail, user_routes,
         search_tags,
     ),
     components(schemas(
         PlaceDetails, PostDetails, PostTagDetails,
-        IncidentDetails, GeoCaptureDetails, CollectionDetails, RouteDetails,
-        ViewportQuery, PostsQuery, PaginationQuery,
+        IncidentDetails, GeoCaptureDetails, SequenceDetails, CollectionDetails, RouteDetails,
+        ViewportQuery, PostsQuery, PaginationQuery, NearbyQuery,
         TagSearchQuery, TagSearchResponse,
     ))
 )]
@@ -127,6 +149,25 @@ pub struct PaginationQuery {
 
 fn default_limit() -> i64 {
     100
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct NearbyQuery {
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(default = "default_nearby_radius")]
+    pub radius: f64,
+    pub exclude_sequence: Option<String>,
+    #[serde(default = "default_nearby_limit")]
+    pub limit: i64,
+}
+
+fn default_nearby_radius() -> f64 {
+    80.0
+}
+
+fn default_nearby_limit() -> i64 {
+    8
 }
 
 fn default_tag_search_limit() -> i64 {
@@ -169,6 +210,45 @@ fn graph_err(e: impl ToString) -> (StatusCode, Json<ApiError>) {
             error: e.to_string(),
         }),
     )
+}
+
+/// Execute a `get_tags_for_*` query and aggregate rows into `(found, Vec<PostTagDetails>)`.
+/// The underlying queries use `OPTIONAL MATCH`, so a target with zero tags emits one
+/// row with NULL label/tagger (found=true, empty vec); a nonexistent target emits
+/// zero rows (found=false). Callers that want 404 semantics check `found`; callers
+/// embedding tags in a detail response can ignore it.
+async fn fetch_tags(
+    query: nexus_common::db::graph::Query,
+) -> Result<(bool, Vec<PostTagDetails>), (StatusCode, Json<ApiError>)> {
+    use std::collections::HashMap;
+
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph.execute(query).await.map_err(graph_err)?;
+
+    let mut found = false;
+    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        found = true;
+        let label: Option<String> = row.get("label").ok();
+        let tagger_id: Option<String> = row.get("tagger_id").ok();
+        if let (Some(l), Some(t)) = (label, tagger_id) {
+            tag_map.entry(l).or_default().push(t);
+        }
+    }
+
+    let tags: Vec<PostTagDetails> = tag_map
+        .into_iter()
+        .map(|(label, taggers)| {
+            let taggers_count = taggers.len();
+            PostTagDetails {
+                label,
+                taggers,
+                taggers_count,
+            }
+        })
+        .collect();
+
+    Ok((found, tags))
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -716,7 +796,9 @@ async fn geo_captures_viewport(
             caption: row.get("caption").ok(),
             sequence_uri: row.get("sequence_uri").ok(),
             sequence_index: row.get("sequence_index").ok(),
+            captured_at: row.get("captured_at").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
+            tags: None,
         });
     }
 
@@ -749,8 +831,8 @@ async fn geo_capture_detail(
         .await
         .map_err(graph_err)?;
 
-    match stream.try_next().await.map_err(graph_err)? {
-        Some(row) => Ok(Json(GeoCaptureDetails {
+    let mut capture = match stream.try_next().await.map_err(graph_err)? {
+        Some(row) => GeoCaptureDetails {
             id: row.get("id").unwrap_or_default(),
             author_id: row.get("author_id").unwrap_or_default(),
             file_uri: row.get("file_uri").unwrap_or_default(),
@@ -764,15 +846,24 @@ async fn geo_capture_detail(
             caption: row.get("caption").ok(),
             sequence_uri: row.get("sequence_uri").ok(),
             sequence_index: row.get("sequence_index").ok(),
+            captured_at: row.get("captured_at").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
-        })),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("GeoCapture {compound_id} not found"),
-            }),
-        )),
-    }
+            tags: None,
+        },
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: format!("GeoCapture {compound_id} not found"),
+                }),
+            ))
+        }
+    };
+
+    let (_found, tags) =
+        fetch_tags(queries::get::get_tags_for_geo_capture(&compound_id)).await?;
+    capture.tags = Some(tags);
+    Ok(Json(capture))
 }
 
 /// List a user's geo captures
@@ -807,25 +898,282 @@ async fn user_geo_captures(
 
     let mut captures = Vec::new();
     while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        captures.push(GeoCaptureDetails {
-            id: row.get("id").unwrap_or_default(),
-            author_id: row.get("author_id").unwrap_or_default(),
-            file_uri: row.get("file_uri").unwrap_or_default(),
-            kind: row.get("kind").unwrap_or_default(),
-            lat: row.get("lat").unwrap_or(0.0),
-            lon: row.get("lon").unwrap_or(0.0),
-            ele: row.get("ele").ok(),
-            heading: row.get("heading").ok(),
-            pitch: row.get("pitch").ok(),
-            fov: row.get("fov").ok(),
-            caption: row.get("caption").ok(),
-            sequence_uri: row.get("sequence_uri").ok(),
-            sequence_index: row.get("sequence_index").ok(),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-        });
+        captures.push(geo_capture_from_row(&row));
     }
 
     Ok(Json(captures))
+}
+
+/// Find GeoCaptures near a GPS point (for cross-sequence street-view navigation)
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/geo_captures/nearby",
+    tag = "GeoCapture",
+    params(
+        ("lat" = f64, Query, description = "Latitude"),
+        ("lon" = f64, Query, description = "Longitude"),
+        ("radius" = Option<f64>, Query, description = "Search radius in meters (default 80)"),
+        ("exclude_sequence" = Option<String>, Query, description = "Exclude captures from this sequence URI"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 8)"),
+    ),
+    responses(
+        (status = 200, description = "Nearby geo captures sorted by distance", body = Vec<GeoCaptureDetails>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn nearby_geo_captures(
+    State(_ctx): State<PluginContext>,
+    axum::extract::Query(params): axum::extract::Query<NearbyQuery>,
+) -> ApiResult<Vec<GeoCaptureDetails>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_nearby_captures(
+            params.lat,
+            params.lon,
+            params.radius,
+            params.exclude_sequence.as_deref(),
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut captures = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        captures.push(geo_capture_from_row(&row));
+    }
+
+    Ok(Json(captures))
+}
+
+/// Get tags for a MapkyAppGeoCapture
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/geo_captures/{author_id}/{capture_id}/tags",
+    tag = "GeoCapture",
+    params(
+        ("author_id" = String, Path, description = "Author's pubky ID"),
+        ("capture_id" = String, Path, description = "GeoCapture ID"),
+    ),
+    responses(
+        (status = 200, description = "Tags on the GeoCapture", body = Vec<PostTagDetails>),
+        (status = 404, description = "GeoCapture not found", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn geo_capture_tags(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, capture_id)): Path<(String, String)>,
+) -> ApiResult<Vec<PostTagDetails>> {
+    let compound_id = format!("{author_id}:{capture_id}");
+    let (found, tags) =
+        fetch_tags(queries::get::get_tags_for_geo_capture(&compound_id)).await?;
+    if !found {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("GeoCapture {compound_id} not found"),
+            }),
+        ));
+    }
+    Ok(Json(tags))
+}
+
+/// Helper to parse a Neo4j row into `GeoCaptureDetails` (no tags).
+fn geo_capture_from_row(row: &neo4rs::Row) -> GeoCaptureDetails {
+    GeoCaptureDetails {
+        id: row.get("id").unwrap_or_default(),
+        author_id: row.get("author_id").unwrap_or_default(),
+        file_uri: row.get("file_uri").unwrap_or_default(),
+        kind: row.get("kind").unwrap_or_default(),
+        lat: row.get("lat").unwrap_or(0.0),
+        lon: row.get("lon").unwrap_or(0.0),
+        ele: row.get("ele").ok(),
+        heading: row.get("heading").ok(),
+        pitch: row.get("pitch").ok(),
+        fov: row.get("fov").ok(),
+        caption: row.get("caption").ok(),
+        sequence_uri: row.get("sequence_uri").ok(),
+        sequence_index: row.get("sequence_index").ok(),
+        captured_at: row.get("captured_at").ok(),
+        indexed_at: row.get("indexed_at").unwrap_or(0),
+        tags: None,
+    }
+}
+
+// ── Sequences ───────────────────────────────────────────────────────────────
+
+/// Get a single sequence by author and ID (tags embedded)
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/sequences/{author_id}/{sequence_id}",
+    tag = "Sequence",
+    params(
+        ("author_id" = String, Path, description = "Author's pubky ID"),
+        ("sequence_id" = String, Path, description = "Sequence ID"),
+    ),
+    responses(
+        (status = 200, description = "Sequence details", body = SequenceDetails),
+        (status = 404, description = "Sequence not found"),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn sequence_detail(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, sequence_id)): Path<(String, String)>,
+) -> ApiResult<SequenceDetails> {
+    let compound_id = format!("{author_id}:{sequence_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_sequence_by_id(&compound_id))
+        .await
+        .map_err(graph_err)?;
+
+    let mut sequence = match stream.try_next().await.map_err(graph_err)? {
+        Some(row) => sequence_from_row(&row),
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: format!("Sequence {compound_id} not found"),
+                }),
+            ))
+        }
+    };
+
+    let (_found, tags) =
+        fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await?;
+    sequence.tags = Some(tags);
+    Ok(Json(sequence))
+}
+
+/// List a user's sequences
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/sequences/user/{user_id}",
+    tag = "Sequence",
+    params(
+        ("user_id" = String, Path, description = "User's pubky ID"),
+        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "User's sequences", body = Vec<SequenceDetails>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn user_sequences(
+    State(_ctx): State<PluginContext>,
+    Path(user_id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> ApiResult<Vec<SequenceDetails>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_user_sequences(
+            &user_id,
+            params.skip,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut sequences = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        sequences.push(sequence_from_row(&row));
+    }
+    Ok(Json(sequences))
+}
+
+/// Get tags for a MapkyAppSequence
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/sequences/{author_id}/{sequence_id}/tags",
+    tag = "Sequence",
+    params(
+        ("author_id" = String, Path, description = "Author's pubky ID"),
+        ("sequence_id" = String, Path, description = "Sequence ID"),
+    ),
+    responses(
+        (status = 200, description = "Tags on the sequence", body = Vec<PostTagDetails>),
+        (status = 404, description = "Sequence not found", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn sequence_tags(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, sequence_id)): Path<(String, String)>,
+) -> ApiResult<Vec<PostTagDetails>> {
+    let compound_id = format!("{author_id}:{sequence_id}");
+    let (found, tags) =
+        fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await?;
+    if !found {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("Sequence {compound_id} not found"),
+            }),
+        ));
+    }
+    Ok(Json(tags))
+}
+
+/// List all captures in a sequence, ordered by `sequence_index` ascending.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/sequences/{author_id}/{sequence_id}/captures",
+    tag = "Sequence",
+    params(
+        ("author_id" = String, Path, description = "Sequence author's pubky ID"),
+        ("sequence_id" = String, Path, description = "Sequence ID"),
+        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "Captures in the sequence", body = Vec<GeoCaptureDetails>),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn sequence_captures(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, sequence_id)): Path<(String, String)>,
+    Query(params): Query<PaginationQuery>,
+) -> ApiResult<Vec<GeoCaptureDetails>> {
+    let sequence_uri = format!("pubky://{author_id}/pub/mapky.app/sequences/{sequence_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_captures_in_sequence(
+            &sequence_uri,
+            params.skip,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut captures = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        captures.push(geo_capture_from_row(&row));
+    }
+    Ok(Json(captures))
+}
+
+/// Helper to parse a Neo4j row into `SequenceDetails` (no tags).
+fn sequence_from_row(row: &neo4rs::Row) -> SequenceDetails {
+    SequenceDetails {
+        id: row.get("id").unwrap_or_default(),
+        author_id: row.get("author_id").unwrap_or_default(),
+        name: row.get("name").ok(),
+        description: row.get("description").ok(),
+        kind: row.get("kind").unwrap_or_default(),
+        captured_at_start: row.get("captured_at_start").unwrap_or(0),
+        captured_at_end: row.get("captured_at_end").unwrap_or(0),
+        capture_count: row.get("capture_count").unwrap_or(0),
+        min_lat: row.get("min_lat").ok(),
+        min_lon: row.get("min_lon").ok(),
+        max_lat: row.get("max_lat").ok(),
+        max_lon: row.get("max_lon").ok(),
+        device: row.get("device").ok(),
+        indexed_at: row.get("indexed_at").unwrap_or(0),
+        tags: None,
+    }
 }
 
 // ── Collections ─────────────────────────────────────────────────────────────
@@ -1165,8 +1513,8 @@ fn route_from_row(row: &neo4rs::Row) -> RouteDetails {
         min_lon: row.get("min_lon").unwrap_or(0.0),
         max_lat: row.get("max_lat").unwrap_or(0.0),
         max_lon: row.get("max_lon").unwrap_or(0.0),
-        start_lat: 0.0, // Not returned in list queries (use min/max for display)
-        start_lon: 0.0,
+        start_lat: row.get("start_lat").unwrap_or(0.0),
+        start_lon: row.get("start_lon").unwrap_or(0.0),
         waypoint_count: row.get("waypoint_count").unwrap_or(0),
         indexed_at: row.get("indexed_at").unwrap_or(0),
     }

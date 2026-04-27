@@ -9,6 +9,7 @@ use crate::models::incident::IncidentDetails;
 use crate::models::place::PlaceDetails;
 use crate::models::post::PostDetails;
 use crate::models::route::RouteDetails;
+use crate::models::sequence::SequenceDetails;
 use nexus_common::db::graph::Query;
 
 /// Create or update a User node (minimal — no profile data from post events).
@@ -195,7 +196,8 @@ pub fn create_geo_capture(capture: &GeoCaptureDetails) -> Query {
              g.fov = $fov,
              g.caption = $caption,
              g.sequence_uri = $sequence_uri,
-             g.sequence_index = $sequence_index",
+             g.sequence_index = $sequence_index,
+             g.captured_at = $captured_at",
     )
     .param("author_id", capture.author_id.clone())
     .param("id", capture.id.clone())
@@ -210,6 +212,7 @@ pub fn create_geo_capture(capture: &GeoCaptureDetails) -> Query {
     .param("caption", capture.caption.clone())
     .param("sequence_uri", capture.sequence_uri.clone())
     .param("sequence_index", capture.sequence_index)
+    .param("captured_at", capture.captured_at)
     .param("indexed_at", capture.indexed_at)
 }
 
@@ -280,6 +283,8 @@ pub fn create_route(route: &RouteDetails) -> Query {
              r.estimated_duration_s = $estimated_duration_s,
              r.image_uri = $image_uri,
              r.start_point = point({latitude: $start_lat, longitude: $start_lon}),
+             r.start_lat = $start_lat,
+             r.start_lon = $start_lon,
              r.min_lat = $min_lat,
              r.min_lon = $min_lon,
              r.max_lat = $max_lat,
@@ -305,6 +310,43 @@ pub fn create_route(route: &RouteDetails) -> Query {
     .param("max_lon", route.max_lon)
     .param("waypoint_count", route.waypoint_count)
     .param("indexed_at", route.indexed_at)
+}
+
+// ── Sequence ────────────────────────────────────────────────────────────
+
+/// MERGE a MapkyAppSequence node with CAPTURED edge.
+pub fn create_sequence(sequence: &SequenceDetails) -> Query {
+    Query::new(
+        "mapky_create_sequence",
+        "MATCH (author:User {id: $author_id})
+         MERGE (author)-[:CAPTURED]->(s:MapkyAppSequence {id: $id})
+         ON CREATE SET s.indexed_at = $indexed_at
+         SET s.name = $name,
+             s.description = $description,
+             s.kind = $kind,
+             s.captured_at_start = $captured_at_start,
+             s.captured_at_end = $captured_at_end,
+             s.capture_count = $capture_count,
+             s.min_lat = $min_lat,
+             s.min_lon = $min_lon,
+             s.max_lat = $max_lat,
+             s.max_lon = $max_lon,
+             s.device = $device",
+    )
+    .param("author_id", sequence.author_id.clone())
+    .param("id", sequence.id.clone())
+    .param("name", sequence.name.clone())
+    .param("description", sequence.description.clone())
+    .param("kind", sequence.kind.clone())
+    .param("captured_at_start", sequence.captured_at_start)
+    .param("captured_at_end", sequence.captured_at_end)
+    .param("capture_count", sequence.capture_count)
+    .param("min_lat", sequence.min_lat)
+    .param("min_lon", sequence.min_lon)
+    .param("max_lat", sequence.max_lat)
+    .param("max_lon", sequence.max_lon)
+    .param("device", sequence.device.clone())
+    .param("indexed_at", sequence.indexed_at)
 }
 
 /// Create a TAGGED relationship from a user to a mapky resource node.

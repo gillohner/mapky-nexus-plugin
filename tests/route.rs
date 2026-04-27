@@ -55,6 +55,7 @@ async fn test_route_lifecycle() -> Result<()> {
         elevation_loss_m: None,
         estimated_duration_s: Some(5400),
         image_uri: None,
+        geometry: None,
     };
     let route_id = route.create_id();
     let route_path: pubky::ResourcePath = MapkyAppRoute::create_path(&route_id).parse()?;

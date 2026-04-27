@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use chrono::Utc;
 
+use crate::models::tag::PostTagDetails;
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GeoCaptureDetails {
     pub id: String, // compound: "user_id:capture_id"
@@ -21,7 +23,13 @@ pub struct GeoCaptureDetails {
     pub caption: Option<String>,
     pub sequence_uri: Option<String>,
     pub sequence_index: Option<i64>,
+    /// UNIX microseconds — moment the media was captured. Distinct from `indexed_at`.
+    pub captured_at: Option<i64>,
     pub indexed_at: i64,
+    /// Tags targeting this capture, aggregated by label. Only populated by
+    /// single-item detail endpoints; list endpoints leave this `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<PostTagDetails>>,
 }
 
 impl GeoCaptureDetails {
@@ -47,7 +55,9 @@ impl GeoCaptureDetails {
             caption: capture.caption.clone(),
             sequence_uri: capture.sequence_uri.clone(),
             sequence_index: capture.sequence_index.map(|i| i as i64),
+            captured_at: capture.captured_at,
             indexed_at: Utc::now().timestamp_millis(),
+            tags: None,
         }
     }
 }

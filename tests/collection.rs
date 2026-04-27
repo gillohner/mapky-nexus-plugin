@@ -37,6 +37,7 @@ async fn test_collection_lifecycle() -> Result<()> {
             "https://www.openstreetmap.org/node/3646146894".to_string(),
         ],
         image_uri: None,
+        color: None,
     };
     let collection_id = collection.create_id();
     let collection_path: pubky::ResourcePath =
@@ -74,6 +75,7 @@ async fn test_collection_lifecycle() -> Result<()> {
         description: Some("Places that accept Bitcoin".to_string()),
         items: vec!["https://www.openstreetmap.org/node/1573053883".to_string()],
         image_uri: None,
+        color: None,
     };
     test.put(&user_kp, &collection_path, &updated_collection)
         .await?;

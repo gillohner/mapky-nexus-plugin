@@ -4,4 +4,5 @@ pub mod incident;
 pub mod place;
 pub mod post;
 pub mod route;
+pub mod sequence;
 pub mod tag;

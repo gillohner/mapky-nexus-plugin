@@ -175,6 +175,7 @@ pub fn get_user_geo_captures(user_id: &str, skip: i64, limit: i64) -> Query {
                 g.caption AS caption,
                 g.sequence_uri AS sequence_uri,
                 g.sequence_index AS sequence_index,
+                g.captured_at AS captured_at,
                 g.indexed_at AS indexed_at
          ORDER BY g.indexed_at DESC
          SKIP $skip LIMIT $limit",
@@ -291,6 +292,7 @@ pub fn get_geo_captures_in_viewport(
                 g.caption AS caption,
                 g.sequence_uri AS sequence_uri,
                 g.sequence_index AS sequence_index,
+                g.captured_at AS captured_at,
                 g.indexed_at AS indexed_at
          ORDER BY g.indexed_at DESC
          LIMIT $limit",
@@ -319,9 +321,106 @@ pub fn get_geo_capture_by_id(compound_id: &str) -> Query {
                 g.caption AS caption,
                 g.sequence_uri AS sequence_uri,
                 g.sequence_index AS sequence_index,
+                g.captured_at AS captured_at,
                 g.indexed_at AS indexed_at",
     )
     .param("id", compound_id)
+}
+
+/// Fetch all captures belonging to a sequence (matched by `sequence_uri`), ordered
+/// by `sequence_index` ascending.
+pub fn get_captures_in_sequence(sequence_uri: &str, skip: i64, limit: i64) -> Query {
+    Query::new(
+        "mapky_captures_in_sequence",
+        "MATCH (u:User)-[:CAPTURED]->(g:MapkyAppGeoCapture)
+         WHERE g.sequence_uri = $sequence_uri
+         RETURN g.id AS id,
+                u.id AS author_id,
+                g.file_uri AS file_uri,
+                g.kind AS kind,
+                g.lat AS lat, g.lon AS lon,
+                g.ele AS ele,
+                g.heading AS heading,
+                g.pitch AS pitch,
+                g.fov AS fov,
+                g.caption AS caption,
+                g.sequence_uri AS sequence_uri,
+                g.sequence_index AS sequence_index,
+                g.captured_at AS captured_at,
+                g.indexed_at AS indexed_at
+         ORDER BY g.sequence_index ASC
+         SKIP $skip LIMIT $limit",
+    )
+    .param("sequence_uri", sequence_uri)
+    .param("skip", skip)
+    .param("limit", limit)
+}
+
+/// Fetch all TAGGED relationships targeting a MapkyAppGeoCapture, aggregated
+/// via `OPTIONAL MATCH`. Returns one row per (tagger, label) pair plus an
+/// `exists` flag. If the capture does not exist, the stream is empty.
+pub fn get_tags_for_geo_capture(compound_id: &str) -> Query {
+    Query::new(
+        "mapky_geo_capture_tags",
+        "MATCH (g:MapkyAppGeoCapture {id: $id})
+         OPTIONAL MATCH (tagger:User)-[tag:TAGGED]->(g)
+         RETURN true AS exists, tag.label AS label, tagger.id AS tagger_id",
+    )
+    .param("id", compound_id)
+}
+
+/// Fetch MapkyAppGeoCapture nodes within a radius of a point, optionally
+/// excluding captures that belong to a specific sequence. Used for
+/// cross-sequence "nearby" navigation in the street-view experience.
+pub fn get_nearby_captures(
+    lat: f64,
+    lon: f64,
+    radius_meters: f64,
+    exclude_sequence_uri: Option<&str>,
+    limit: i64,
+) -> Query {
+    let seq_filter = match exclude_sequence_uri {
+        Some(_) => "AND (g.sequence_uri IS NULL OR g.sequence_uri <> $exclude_seq)",
+        None => "",
+    };
+
+    let cypher = format!(
+        "MATCH (u:User)-[:CAPTURED]->(g:MapkyAppGeoCapture)
+         WHERE point.distance(
+             g.location,
+             point({{latitude: $lat, longitude: $lon}})
+         ) < $radius
+         {seq_filter}
+         RETURN g.id AS id,
+                u.id AS author_id,
+                g.file_uri AS file_uri,
+                g.kind AS kind,
+                g.lat AS lat, g.lon AS lon,
+                g.ele AS ele,
+                g.heading AS heading,
+                g.pitch AS pitch,
+                g.fov AS fov,
+                g.caption AS caption,
+                g.sequence_uri AS sequence_uri,
+                g.sequence_index AS sequence_index,
+                g.captured_at AS captured_at,
+                g.indexed_at AS indexed_at,
+                point.distance(g.location, point({{latitude: $lat, longitude: $lon}})) AS distance
+         ORDER BY distance ASC
+         LIMIT $limit"
+    );
+
+    let mut q = Query::new("mapky_nearby_captures", cypher)
+        .param("lat", lat)
+        .param("lon", lon)
+        .param("radius", radius_meters)
+        .param("limit", limit);
+
+    if let Some(seq_uri) = exclude_sequence_uri {
+        q = q.param("exclude_seq", seq_uri.to_string());
+    }
+
+    q
 }
 
 /// Check if a MapkyAppGeoCapture exists (for resolve_graph_node).
@@ -445,6 +544,7 @@ pub fn get_routes_in_viewport(
                 r.image_uri AS image_uri,
                 r.min_lat AS min_lat, r.min_lon AS min_lon,
                 r.max_lat AS max_lat, r.max_lon AS max_lon,
+                r.start_lat AS start_lat, r.start_lon AS start_lon,
                 r.waypoint_count AS waypoint_count,
                 r.indexed_at AS indexed_at
          ORDER BY r.indexed_at DESC
@@ -475,6 +575,7 @@ pub fn get_route_by_id(compound_id: &str) -> Query {
                 r.image_uri AS image_uri,
                 r.min_lat AS min_lat, r.min_lon AS min_lon,
                 r.max_lat AS max_lat, r.max_lon AS max_lon,
+                r.start_lat AS start_lat, r.start_lon AS start_lon,
                 r.waypoint_count AS waypoint_count,
                 r.indexed_at AS indexed_at",
     )
@@ -499,6 +600,7 @@ pub fn get_user_routes(user_id: &str, skip: i64, limit: i64) -> Query {
                 r.image_uri AS image_uri,
                 r.min_lat AS min_lat, r.min_lon AS min_lon,
                 r.max_lat AS max_lat, r.max_lon AS max_lon,
+                r.start_lat AS start_lat, r.start_lon AS start_lon,
                 r.waypoint_count AS waypoint_count,
                 r.indexed_at AS indexed_at
          ORDER BY r.indexed_at DESC
@@ -592,6 +694,64 @@ pub fn search_posts_by_tag(query_str: &str, limit: i64) -> Query {
     )
     .param("query", query_str)
     .param("limit", limit)
+}
+
+// ── Sequence queries ────────────────────────────────────────────────────
+
+const SEQUENCE_FIELDS: &str = "s.id AS id,
+        u.id AS author_id,
+        s.name AS name,
+        s.description AS description,
+        s.kind AS kind,
+        s.captured_at_start AS captured_at_start,
+        s.captured_at_end AS captured_at_end,
+        s.capture_count AS capture_count,
+        s.min_lat AS min_lat, s.min_lon AS min_lon,
+        s.max_lat AS max_lat, s.max_lon AS max_lon,
+        s.device AS device,
+        s.indexed_at AS indexed_at";
+
+/// Fetch a single MapkyAppSequence by compound ID.
+pub fn get_sequence_by_id(compound_id: &str) -> Query {
+    let cypher = format!(
+        "MATCH (u:User)-[:CAPTURED]->(s:MapkyAppSequence {{id: $id}})
+         RETURN {SEQUENCE_FIELDS}"
+    );
+    Query::new("mapky_get_sequence", &cypher).param("id", compound_id)
+}
+
+/// Fetch a user's sequences, most recent first.
+pub fn get_user_sequences(user_id: &str, skip: i64, limit: i64) -> Query {
+    let cypher = format!(
+        "MATCH (u:User {{id: $user_id}})-[:CAPTURED]->(s:MapkyAppSequence)
+         RETURN {SEQUENCE_FIELDS}
+         ORDER BY s.indexed_at DESC
+         SKIP $skip LIMIT $limit"
+    );
+    Query::new("mapky_user_sequences", &cypher)
+        .param("user_id", user_id)
+        .param("skip", skip)
+        .param("limit", limit)
+}
+
+/// Fetch tags on a MapkyAppSequence, aggregated by label.
+pub fn get_tags_for_sequence(compound_id: &str) -> Query {
+    Query::new(
+        "mapky_sequence_tags",
+        "MATCH (s:MapkyAppSequence {id: $id})
+         OPTIONAL MATCH (tagger:User)-[tag:TAGGED]->(s)
+         RETURN true AS exists, tag.label AS label, tagger.id AS tagger_id",
+    )
+    .param("id", compound_id)
+}
+
+/// Check if a MapkyAppSequence exists (for cross-domain resolution).
+pub fn mapky_sequence_exists(compound_id: &str) -> Query {
+    Query::new(
+        "mapky_sequence_exists",
+        "MATCH (s:MapkyAppSequence {id: $id}) RETURN count(s) > 0 AS exists",
+    )
+    .param("id", compound_id)
 }
 
 /// Fetch only review posts (rating > 0) for a place, most recent first.

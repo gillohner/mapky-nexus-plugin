@@ -33,6 +33,7 @@ fn neo4j_label_for(resource_type: &str) -> Option<&'static str> {
         "incidents" => Some("MapkyAppIncident"),
         "geo_captures" => Some("MapkyAppGeoCapture"),
         "routes" => Some("MapkyAppRoute"),
+        "sequences" => Some("MapkyAppSequence"),
         _ => None,
     }
 }

@@ -83,3 +83,19 @@ pub fn delete_route(author_id: &str, compound_id: &str) -> Query {
     .param("author_id", author_id)
     .param("compound_id", compound_id)
 }
+
+/// Delete a MapkyAppSequence and its relationships.
+///
+/// GeoCaptures that referenced the sequence via `sequence_uri` continue to exist
+/// — their property simply becomes a dangling reference. The alternative (cascading
+/// GeoCapture deletes) would be destructive; callers should delete the captures
+/// separately if desired.
+pub fn delete_sequence(author_id: &str, compound_id: &str) -> Query {
+    Query::new(
+        "mapky_delete_sequence",
+        "MATCH (u:User {id: $author_id})-[:CAPTURED]->(s:MapkyAppSequence {id: $compound_id})
+         DETACH DELETE s",
+    )
+    .param("author_id", author_id)
+    .param("compound_id", compound_id)
+}

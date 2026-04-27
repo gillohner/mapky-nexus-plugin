@@ -39,6 +39,7 @@ async fn test_geo_capture_lifecycle() -> Result<()> {
         caption: Some("View from Gurten".to_string()),
         sequence_uri: None,
         sequence_index: None,
+        captured_at: Some(1_750_000_000_000_000), // mid-2025 (microseconds)
     };
     let capture_id = capture.create_id();
     let capture_path: pubky::ResourcePath =
@@ -53,7 +54,8 @@ async fn test_geo_capture_lifecycle() -> Result<()> {
             Query::new(
                 "test_check_geo_capture",
                 "MATCH (u:User {id: $user_id})-[:CAPTURED]->(g:MapkyAppGeoCapture {id: $id})
-                 RETURN g.kind AS kind, g.ele AS ele, g.caption AS caption",
+                 RETURN g.kind AS kind, g.ele AS ele, g.caption AS caption,
+                        g.captured_at AS captured_at",
             )
             .param("user_id", user_id.as_str())
             .param("id", compound_id.as_str()),
@@ -65,8 +67,10 @@ async fn test_geo_capture_lifecycle() -> Result<()> {
     let row = row.unwrap();
     let kind: String = row.get("kind")?;
     let ele: f64 = row.get("ele")?;
+    let captured_at: i64 = row.get("captured_at")?;
     assert_eq!(kind, "photo");
     assert!((ele - 540.0).abs() < 0.1);
+    assert_eq!(captured_at, 1_750_000_000_000_000);
 
     // Delete and verify.
     test.del(&user_kp, &capture_path).await?;

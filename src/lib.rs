@@ -119,6 +119,9 @@ impl NexusPlugin for MapkyPlugin {
             MapkyAppObject::Route(route) => {
                 handlers::route::sync_put(&route, user_id, resource_id).await?;
             }
+            MapkyAppObject::Sequence(sequence) => {
+                handlers::sequence::sync_put(&sequence, user_id, resource_id).await?;
+            }
         }
 
         Ok(())
@@ -155,6 +158,9 @@ impl NexusPlugin for MapkyPlugin {
             }
             "routes" => {
                 handlers::route::del(user_id, resource_id).await?;
+            }
+            "sequences" => {
+                handlers::sequence::del(user_id, resource_id).await?;
             }
             _ => {
                 debug!("Skipping DEL for '{resource_type}' at {uri}");
@@ -231,6 +237,12 @@ impl NexusPlugin for MapkyPlugin {
                 "mapky_schema_route_start",
                 "CREATE POINT INDEX mapky_route_start IF NOT EXISTS \
                  FOR (r:MapkyAppRoute) ON (r.start_point)",
+            ),
+            // ── MapkyAppSequence ──
+            (
+                "mapky_schema_sequence_unique",
+                "CREATE CONSTRAINT mapky_sequence_unique IF NOT EXISTS \
+                 FOR (s:MapkyAppSequence) REQUIRE s.id IS UNIQUE",
             ),
         ];
 
