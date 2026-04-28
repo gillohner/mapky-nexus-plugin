@@ -32,7 +32,6 @@ async fn test_route_lifecycle() -> Result<()> {
         name: "Uetliberg trail".to_string(),
         description: Some("A walk from Zurich to Uetliberg".to_string()),
         activity: RouteActivityType::Hiking,
-        difficulty: None,
         waypoints: vec![
             Waypoint {
                 lat: 47.3769,

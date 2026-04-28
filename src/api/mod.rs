@@ -1503,7 +1503,6 @@ fn route_from_row(row: &neo4rs::Row) -> RouteDetails {
         name: row.get("name").unwrap_or_default(),
         description: row.get("description").ok(),
         activity: row.get("activity").unwrap_or_default(),
-        difficulty: row.get("difficulty").ok(),
         distance_m: row.get("distance_m").ok(),
         elevation_gain_m: row.get("elevation_gain_m").ok(),
         elevation_loss_m: row.get("elevation_loss_m").ok(),

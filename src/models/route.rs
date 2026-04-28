@@ -14,7 +14,6 @@ pub struct RouteDetails {
     pub name: String,
     pub description: Option<String>,
     pub activity: String,
-    pub difficulty: Option<String>,
     pub distance_m: Option<f64>,
     pub elevation_gain_m: Option<f64>,
     pub elevation_loss_m: Option<f64>,
@@ -68,11 +67,6 @@ impl RouteDetails {
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_default(),
-            difficulty: route.difficulty.as_ref().and_then(|d| {
-                serde_json::to_value(d)
-                    .ok()
-                    .and_then(|v| v.as_str().map(String::from))
-            }),
             distance_m: route.distance_m,
             elevation_gain_m: route.elevation_gain_m,
             elevation_loss_m: route.elevation_loss_m,

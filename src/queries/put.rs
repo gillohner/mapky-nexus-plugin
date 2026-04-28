@@ -276,7 +276,6 @@ pub fn create_route(route: &RouteDetails) -> Query {
          SET r.name = $name,
              r.description = $description,
              r.activity = $activity,
-             r.difficulty = $difficulty,
              r.distance_m = $distance_m,
              r.elevation_gain_m = $elevation_gain_m,
              r.elevation_loss_m = $elevation_loss_m,
@@ -296,7 +295,6 @@ pub fn create_route(route: &RouteDetails) -> Query {
     .param("name", route.name.clone())
     .param("description", route.description.clone())
     .param("activity", route.activity.clone())
-    .param("difficulty", route.difficulty.clone())
     .param("distance_m", route.distance_m)
     .param("elevation_gain_m", route.elevation_gain_m)
     .param("elevation_loss_m", route.elevation_loss_m)
