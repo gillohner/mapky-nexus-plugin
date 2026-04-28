@@ -31,18 +31,28 @@ All models are defined in [`mapky-app-specs`](https://github.com/gillohner/mapky
 | Model | Path | Indexed |
 |---|---|---|
 | `MapkyAppPost` | `/pub/mapky.app/posts/<id>` | Yes — nodes, edges, rating aggregates |
-| `MapkyAppCollection` | `/pub/mapky.app/collections/<id>` | Stub (v1) |
-| `MapkyAppIncident` | `/pub/mapky.app/incidents/<id>` | Stub (v1) |
-| `MapkyAppGeoCapture` | `/pub/mapky.app/geo_captures/<id>` | Stub (v1) |
-| `MapkyAppRoute` | `/pub/mapky.app/routes/<id>` | Stub (v1) |
+| `MapkyAppCollection` | `/pub/mapky.app/collections/<id>` | Yes — node + items list |
+| `MapkyAppIncident` | `/pub/mapky.app/incidents/<id>` | Yes — node + spatial point |
+| `MapkyAppGeoCapture` | `/pub/mapky.app/geo_captures/<id>` | Yes — node + spatial point + heading |
+| `MapkyAppSequence` | `/pub/mapky.app/sequences/<id>` | Yes — ordered list of geo-captures |
+| `MapkyAppRoute` | `/pub/mapky.app/routes/<id>` | Yes — metadata + bbox + start point (polyline stays on the homeserver) |
 
-Tags on places use standard `PubkyAppTag` (universal tags) stored at `/pub/mapky.app/tags/`, indexed by pubky-nexus as generic Resource nodes.
+Tags on places, posts, routes, etc. use standard `PubkyAppTag` (universal tags)
+stored at `/pub/mapky.app/tags/`. The plugin implements `resolve_graph_node()`
+so nexus core can create `(User)-[:TAGGED {label}]->(MapkyApp*)` edges across
+all MapKy resource types — that's what powers tag-based search of routes
+without dedicated tag tables.
 
 ### Neo4j Graph Schema
 
 ```
-(:User)-[:AUTHORED]->(:MapkyPost)-[:ABOUT]->(:Place)
-(:MapkyPost)-[:REPLY_TO]->(:MapkyPost)   // threaded replies
+(:User)-[:AUTHORED]->(:MapkyAppPost)-[:ABOUT]->(:Place)
+(:MapkyAppPost)-[:REPLY_TO]->(:MapkyAppPost)         // threaded replies
+(:User)-[:CREATED]->(:MapkyAppCollection)
+(:User)-[:REPORTED]->(:MapkyAppIncident)
+(:User)-[:AUTHORED]->(:MapkyAppGeoCapture)
+(:User)-[:CREATED]->(:MapkyAppRoute)
+(:User)-[:TAGGED {label}]->(<MapkyApp* | Place>)     // cross-domain
 
 Place {
   osm_canonical, osm_type, osm_id,
@@ -52,12 +62,25 @@ Place {
   tag_count, photo_count
 }
 
-MapkyPost {
+MapkyAppPost {
   id, content, rating,
   kind,          // "review" | "post"
   parent_uri,    // pubky:// URI of parent post (replies)
   attachments,   // list of pubky:// URIs
   indexed_at
+}
+
+MapkyAppRoute {
+  id, name, description, activity,
+  distance_m, estimated_duration_s,
+  elevation_gain_m, elevation_loss_m,
+  waypoint_count,
+  start_point: point,                    // spatial index for nearby/viewport
+  min_lat, min_lon, max_lat, max_lon,    // bbox-contains queries
+  indexed_at
+  // Note: waypoints + encoded polyline are NOT here. They live on
+  // the author's homeserver and are fetched lazily by the frontend
+  // when rendering a route detail.
 }
 ```
 
@@ -72,9 +95,26 @@ Mounted at `/v0/mapky/` by nexusd. Full schema at
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/v0/mapky/viewport` | Places in a lat/lon bounding box |
-| `GET` | `/v0/mapky/place/{osm_type}/{osm_id}` | Single place detail |
-| `GET` | `/v0/mapky/place/{osm_type}/{osm_id}/posts` | Posts for a place (paginated, optional `reviews_only`) |
+| `GET` | `/viewport` | Places in a lat/lon bounding box |
+| `GET` | `/place/{osm_type}/{osm_id}` | Single place detail |
+| `GET` | `/place/{osm_type}/{osm_id}/posts` | Posts for a place (paginated, optional `reviews_only`) |
+| `GET` | `/place/{osm_type}/{osm_id}/tags` | Tags on a place |
+| `GET` | `/place/{osm_type}/{osm_id}/routes` | Routes passing near a place (bbox-contains) |
+| `GET` | `/posts/{author_id}/{post_id}/tags` | Tags on a post |
+| `GET` | `/posts/user/{user_id}` | A user's posts |
+| `GET` | `/incidents/viewport` | Incidents in a bbox |
+| `GET` | `/incidents/{author_id}/{incident_id}` | Incident detail |
+| `GET` | `/incidents/user/{user_id}` | A user's incidents |
+| `GET` | `/geo_captures/viewport` | Geo-captures in a bbox |
+| `GET` | `/geo_captures/nearby` | Geo-captures near a point |
+| `GET` | `/geo_captures/user/{user_id}` | A user's geo-captures |
+| `GET` | `/sequences/user/{user_id}` | A user's capture sequences |
+| `GET` | `/collections/user/{user_id}` | A user's collections |
+| `GET` | `/routes/viewport` | Routes intersecting a bbox (metadata + start point only — no polyline) |
+| `GET` | `/routes/{author_id}/{route_id}` | Route metadata |
+| `GET` | `/routes/{author_id}/{route_id}/tags` | Tags on a route |
+| `GET` | `/routes/user/{user_id}` | A user's routes |
+| `GET` | `/search/tags?q=` | Tag search across places, collections, posts |
 
 ### Example
 
@@ -84,6 +124,12 @@ curl 'localhost:8080/v0/mapky/viewport?min_lat=48.1&min_lon=16.3&max_lat=48.3&ma
 
 # Reviews for a specific OSM way
 curl 'localhost:8080/v0/mapky/place/way/618456759/posts?reviews_only=true'
+
+# Routes passing near a place
+curl 'localhost:8080/v0/mapky/place/way/618456759/routes'
+
+# Routes in a bbox (metadata only — fetch the body from the homeserver)
+curl 'localhost:8080/v0/mapky/routes/viewport?min_lat=46.7&min_lon=6.1&max_lat=47.7&max_lon=9.6'
 ```
 
 ## Running with Nexus
