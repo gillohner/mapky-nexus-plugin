@@ -30,6 +30,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/place/{osm_type}/{osm_id}", get(place_detail))
         .route("/place/{osm_type}/{osm_id}/posts", get(place_posts))
         .route("/place/{osm_type}/{osm_id}/tags", get(place_tags))
+        .route("/place/{osm_type}/{osm_id}/routes", get(place_routes))
         // ── Post ──
         .route("/posts/{author_id}/{post_id}/tags", get(post_tags))
         .route("/posts/user/{user_id}", get(user_posts))
@@ -80,6 +81,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         // ── Route ──
         .route("/routes/viewport", get(routes_viewport))
         .route("/routes/{author_id}/{route_id}", get(route_detail))
+        .route("/routes/{author_id}/{route_id}/tags", get(route_tags))
         .route("/routes/user/{user_id}", get(user_routes))
         // ── Search ──
         .route("/search/tags", get(search_tags))
@@ -99,13 +101,13 @@ pub fn routes(ctx: PluginContext) -> Router {
         (name = "Search", description = "Cross-resource search"),
     ),
     paths(
-        viewport, place_detail, place_posts, place_tags,
+        viewport, place_detail, place_posts, place_tags, place_routes,
         post_tags, user_posts,
         incidents_viewport, incident_detail, user_incidents,
         geo_captures_viewport, geo_capture_detail, geo_capture_tags, user_geo_captures, nearby_geo_captures,
         sequence_detail, sequence_tags, sequence_captures, user_sequences,
         collection_detail, user_collections, collections_for_place, collection_tags,
-        routes_viewport, route_detail, user_routes,
+        routes_viewport, route_detail, route_tags, user_routes,
         search_tags,
     ),
     components(schemas(
@@ -1484,6 +1486,131 @@ async fn user_routes(
             params.skip,
             params.limit,
         ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut routes = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        routes.push(route_from_row(&row));
+    }
+
+    Ok(Json(routes))
+}
+
+/// Get tags for a MapkyAppRoute
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/routes/{author_id}/{route_id}/tags",
+    tag = "Route",
+    params(
+        ("author_id" = String, Path, description = "Author's pubky ID"),
+        ("route_id" = String, Path, description = "MapkyAppRoute ID"),
+    ),
+    responses(
+        (status = 200, description = "Tags for a MapkyAppRoute", body = Vec<PostTagDetails>),
+        (status = 404, description = "Route not found"),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn route_tags(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, route_id)): Path<(String, String)>,
+) -> ApiResult<Vec<PostTagDetails>> {
+    use std::collections::HashMap;
+
+    let compound_id = format!("{author_id}:{route_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+
+    let mut stream = graph
+        .execute(queries::get::get_tags_for_mapky_route(&compound_id))
+        .await
+        .map_err(graph_err)?;
+
+    let mut found = false;
+    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
+
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        found = true;
+        let label: Option<String> = row.get("label").ok();
+        let tagger_id: Option<String> = row.get("tagger_id").ok();
+        if let (Some(l), Some(t)) = (label, tagger_id) {
+            tag_map.entry(l).or_default().push(t);
+        }
+    }
+
+    if !found {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("Route {compound_id} not found"),
+            }),
+        ));
+    }
+
+    let tags: Vec<PostTagDetails> = tag_map
+        .into_iter()
+        .map(|(label, taggers)| {
+            let taggers_count = taggers.len();
+            PostTagDetails {
+                label,
+                taggers,
+                taggers_count,
+            }
+        })
+        .collect();
+
+    Ok(Json(tags))
+}
+
+/// List routes whose bounding box covers a given OSM place. Used by the
+/// place detail panel to show "routes that pass through here".
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/place/{osm_type}/{osm_id}/routes",
+    tag = "Place",
+    params(
+        ("osm_type" = String, Path, description = "OSM element type: node, way, or relation"),
+        ("osm_id" = i64, Path, description = "OSM element ID"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 50)"),
+    ),
+    responses(
+        (status = 200, description = "Routes near the place", body = Vec<RouteDetails>),
+        (status = 404, description = "Place not found"),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn place_routes(
+    State(_ctx): State<PluginContext>,
+    Path((osm_type, osm_id)): Path<(String, i64)>,
+    Query(params): Query<PaginationQuery>,
+) -> ApiResult<Vec<RouteDetails>> {
+    let osm_canonical = format!("{osm_type}/{osm_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+
+    // Resolve the place's lat/lon first — bounding-box-contains needs the
+    // point to test against. 404 if the place isn't indexed yet.
+    let mut place_stream = graph
+        .execute(queries::get::get_place_by_canonical(&osm_canonical))
+        .await
+        .map_err(graph_err)?;
+    let place_row = place_stream.try_next().await.map_err(graph_err)?;
+    let (lat, lon): (f64, f64) = match place_row {
+        Some(r) => (
+            r.get("lat").unwrap_or(0.0),
+            r.get("lon").unwrap_or(0.0),
+        ),
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: format!("Place {osm_canonical} not found"),
+                }),
+            ));
+        }
+    };
+
+    let mut stream = graph
+        .execute(queries::get::get_routes_near_point(lat, lon, params.limit))
         .await
         .map_err(graph_err)?;
 

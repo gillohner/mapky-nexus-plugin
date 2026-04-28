@@ -617,6 +617,54 @@ pub fn mapky_route_exists(compound_id: &str) -> Query {
     .param("id", compound_id)
 }
 
+/// Fetch all TAGGED relationships targeting a MapkyAppRoute. Returns one
+/// row per (tagger, label); `exists` is true if the route node was found
+/// even when no tags are attached.
+pub fn get_tags_for_mapky_route(compound_id: &str) -> Query {
+    Query::new(
+        "mapky_route_tags",
+        "MATCH (r:MapkyAppRoute {id: $id})
+         OPTIONAL MATCH (tagger:User)-[tag:TAGGED]->(r)
+         RETURN true AS exists, tag.label AS label, tagger.id AS tagger_id",
+    )
+    .param("id", compound_id)
+}
+
+/// Fetch routes whose bounding box contains the given point, ordered by
+/// distance from the route's start. Used by the place detail panel to
+/// surface "routes that pass through here".
+pub fn get_routes_near_point(lat: f64, lon: f64, limit: i64) -> Query {
+    Query::new(
+        "mapky_routes_near_point",
+        "MATCH (u:User)-[:CREATED]->(r:MapkyAppRoute)
+         WHERE r.min_lat <= $lat AND r.max_lat >= $lat
+           AND r.min_lon <= $lon AND r.max_lon >= $lon
+         RETURN r.id AS id,
+                u.id AS author_id,
+                r.name AS name,
+                r.description AS description,
+                r.activity AS activity,
+                r.distance_m AS distance_m,
+                r.elevation_gain_m AS elevation_gain_m,
+                r.elevation_loss_m AS elevation_loss_m,
+                r.estimated_duration_s AS estimated_duration_s,
+                r.image_uri AS image_uri,
+                r.min_lat AS min_lat, r.min_lon AS min_lon,
+                r.max_lat AS max_lat, r.max_lon AS max_lon,
+                r.start_lat AS start_lat, r.start_lon AS start_lon,
+                r.waypoint_count AS waypoint_count,
+                r.indexed_at AS indexed_at
+         ORDER BY point.distance(
+             r.start_point,
+             point({latitude: $lat, longitude: $lon})
+         ) ASC
+         LIMIT $limit",
+    )
+    .param("lat", lat)
+    .param("lon", lon)
+    .param("limit", limit)
+}
+
 // ── Tag search queries ─────────────────────────────────────────────────
 
 /// Search for Places tagged with a label that contains the query string.
