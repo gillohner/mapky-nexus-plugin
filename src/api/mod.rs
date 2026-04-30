@@ -189,6 +189,7 @@ pub struct TagSearchResponse {
     pub places: Vec<PlaceDetails>,
     pub collections: Vec<CollectionDetails>,
     pub posts: Vec<PostDetails>,
+    pub routes: Vec<RouteDetails>,
 }
 
 /// Strip the `author_id:` prefix from a compound Neo4j post id, returning just the short post_id.
@@ -1723,6 +1724,7 @@ async fn search_tags(
             places: Vec::new(),
             collections: Vec::new(),
             posts: Vec::new(),
+            routes: Vec::new(),
         }));
     }
 
@@ -1793,9 +1795,20 @@ async fn search_tags(
         });
     }
 
+    // Search routes by tag
+    let mut routes = Vec::new();
+    let mut stream = graph
+        .execute(queries::get::search_routes_by_tag(&query_str, params.limit))
+        .await
+        .map_err(graph_err)?;
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        routes.push(route_from_row(&row));
+    }
+
     Ok(Json(TagSearchResponse {
         places,
         collections,
         posts,
+        routes,
     }))
 }

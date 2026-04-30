@@ -782,6 +782,36 @@ pub fn search_posts_by_tag(query_str: &str, limit: i64) -> Query {
     .param("limit", limit)
 }
 
+/// Search for MapkyAppRoutes tagged with a label that contains the query string.
+pub fn search_routes_by_tag(query_str: &str, limit: i64) -> Query {
+    Query::new(
+        "mapky_search_routes_by_tag",
+        "MATCH (tagger:User)-[t:TAGGED]->(r:MapkyAppRoute)
+         WHERE t.label CONTAINS $query
+         WITH r, count(DISTINCT tagger) AS tagger_count
+         ORDER BY tagger_count DESC
+         LIMIT $limit
+         MATCH (u:User)-[:CREATED]->(r)
+         RETURN r.id AS id,
+                u.id AS author_id,
+                r.name AS name,
+                r.description AS description,
+                r.activity AS activity,
+                r.distance_m AS distance_m,
+                r.elevation_gain_m AS elevation_gain_m,
+                r.elevation_loss_m AS elevation_loss_m,
+                r.estimated_duration_s AS estimated_duration_s,
+                r.image_uri AS image_uri,
+                r.min_lat AS min_lat, r.min_lon AS min_lon,
+                r.max_lat AS max_lat, r.max_lon AS max_lon,
+                r.start_lat AS start_lat, r.start_lon AS start_lon,
+                r.waypoint_count AS waypoint_count,
+                r.indexed_at AS indexed_at",
+    )
+    .param("query", query_str)
+    .param("limit", limit)
+}
+
 // ── Sequence queries ────────────────────────────────────────────────────
 
 const SEQUENCE_FIELDS: &str = "s.id AS id,
