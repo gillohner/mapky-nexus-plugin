@@ -65,6 +65,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         )
         .route("/sequences/user/{user_id}", get(user_sequences))
         // ── Collection ──
+        .route("/collections/viewport", get(collections_viewport))
         .route(
             "/collections/{author_id}/{collection_id}",
             get(collection_detail),
@@ -106,7 +107,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         incidents_viewport, incident_detail, user_incidents,
         geo_captures_viewport, geo_capture_detail, geo_capture_tags, user_geo_captures, nearby_geo_captures,
         sequence_detail, sequence_tags, sequence_captures, user_sequences,
-        collection_detail, user_collections, collections_for_place, collection_tags,
+        collections_viewport, collection_detail, user_collections, collections_for_place, collection_tags,
         routes_viewport, route_detail, route_tags, user_routes,
         search_tags,
     ),
@@ -1224,6 +1225,56 @@ async fn collection_detail(
             }),
         )),
     }
+}
+
+/// List collections that contain at least one place inside the viewport
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/collections/viewport",
+    tag = "Collection",
+    params(
+        ("min_lat" = f64, Query, description = "Minimum latitude"),
+        ("min_lon" = f64, Query, description = "Minimum longitude"),
+        ("max_lat" = f64, Query, description = "Maximum latitude"),
+        ("max_lon" = f64, Query, description = "Maximum longitude"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)")
+    ),
+    responses(
+        (status = 200, description = "Collections with places in viewport", body = Vec<CollectionDetails>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn collections_viewport(
+    State(_ctx): State<PluginContext>,
+    Query(params): Query<ViewportQuery>,
+) -> ApiResult<Vec<CollectionDetails>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_collections_in_viewport(
+            params.min_lat,
+            params.min_lon,
+            params.max_lat,
+            params.max_lon,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut collections = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        collections.push(CollectionDetails {
+            id: row.get("id").unwrap_or_default(),
+            author_id: row.get("author_id").unwrap_or_default(),
+            name: row.get("name").unwrap_or_default(),
+            description: row.get("description").ok(),
+            items: row.get::<Vec<String>>("items").unwrap_or_default(),
+            image_uri: row.get("image_uri").ok(),
+            color: row.get("color").ok(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+
+    Ok(Json(collections))
 }
 
 /// List collections for a user

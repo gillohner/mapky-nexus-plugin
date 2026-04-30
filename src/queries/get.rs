@@ -496,6 +496,47 @@ pub fn get_collections_containing_place(osm_canonical: &str) -> Query {
     .param("osm_canonical", osm_canonical)
 }
 
+/// Fetch public collections with at least one Place inside the given
+/// bounding box. Used by the discover sidebar's "In this area" tab so
+/// users can browse what others have curated near where they're
+/// looking, without needing an account.
+pub fn get_collections_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    limit: i64,
+) -> Query {
+    Query::new(
+        "mapky_collections_viewport",
+        "MATCH (u:User)-[:CREATED]->(c:MapkyAppCollection)-[:CONTAINS]->(p:Place)
+         WHERE p.geocoded = true
+           AND point.withinBBox(
+             p.location,
+             point({latitude: $min_lat, longitude: $min_lon}),
+             point({latitude: $max_lat, longitude: $max_lon})
+         )
+         WITH DISTINCT c, u
+         OPTIONAL MATCH (c)-[:CONTAINS]->(all_p:Place)
+         WITH u, c, collect('https://www.openstreetmap.org/' + all_p.osm_canonical) AS items
+         RETURN c.id AS id,
+                u.id AS author_id,
+                c.name AS name,
+                c.description AS description,
+                items,
+                c.image_uri AS image_uri,
+                c.color AS color,
+                c.indexed_at AS indexed_at
+         ORDER BY c.indexed_at DESC
+         LIMIT $limit",
+    )
+    .param("min_lat", min_lat)
+    .param("min_lon", min_lon)
+    .param("max_lat", max_lat)
+    .param("max_lon", max_lon)
+    .param("limit", limit)
+}
+
 /// Fetch tags on a collection, aggregated by label.
 pub fn get_tags_for_collection(compound_id: &str) -> Query {
     Query::new(
