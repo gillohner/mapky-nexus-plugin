@@ -7,6 +7,7 @@
 mod api;
 pub mod handlers;
 pub mod models;
+pub mod osm;
 pub mod queries;
 
 use axum::Router;

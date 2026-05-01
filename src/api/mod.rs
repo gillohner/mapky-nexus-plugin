@@ -21,6 +21,7 @@ use crate::models::post::PostDetails;
 use crate::models::route::RouteDetails;
 use crate::models::sequence::SequenceDetails;
 use crate::models::tag::PostTagDetails;
+use crate::osm::{batch_lookup_cached, NominatimLookup};
 use crate::queries;
 
 pub fn routes(ctx: PluginContext) -> Router {
@@ -86,6 +87,8 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/routes/user/{user_id}", get(user_routes))
         // ── Search ──
         .route("/search/tags", get(search_tags))
+        // ── OSM auxiliary services ──
+        .route("/osm/lookup", get(osm_lookup))
         .with_state(ctx)
 }
 
@@ -100,6 +103,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         (name = "Collection", description = "Curated collections of places"),
         (name = "Route", description = "Routes and trails"),
         (name = "Search", description = "Cross-resource search"),
+        (name = "OSM", description = "Cached Nominatim lookups (rate-limited proxy)"),
     ),
     paths(
         viewport, place_detail, place_posts, place_tags, place_routes,
@@ -110,12 +114,14 @@ pub fn routes(ctx: PluginContext) -> Router {
         collections_viewport, collection_detail, user_collections, collections_for_place, collection_tags,
         routes_viewport, route_detail, route_tags, user_routes,
         search_tags,
+        osm_lookup,
     ),
     components(schemas(
         PlaceDetails, PostDetails, PostTagDetails,
         IncidentDetails, GeoCaptureDetails, SequenceDetails, CollectionDetails, RouteDetails,
         ViewportQuery, PostsQuery, PaginationQuery, NearbyQuery,
         TagSearchQuery, TagSearchResponse,
+        OsmLookupQuery, NominatimLookup,
     ))
 )]
 pub struct MapkyApiDoc;
@@ -182,6 +188,14 @@ pub struct TagSearchQuery {
     pub q: String,
     #[serde(default = "default_tag_search_limit")]
     pub limit: i64,
+}
+
+/// Query for the cached OSM lookup. Comma-separated list of OSM IDs
+/// in the standard `N123,W456,R789` form (Nominatim's input format).
+/// Up to ~50 per call — beyond that the handler chunks internally.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct OsmLookupQuery {
+    pub osm_ids: String,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -1811,4 +1825,56 @@ async fn search_tags(
         posts,
         routes,
     }))
+}
+
+/// Cached batched OSM lookup. Frontend hits this instead of public
+/// Nominatim — Redis-backed (30 d TTL) and rate-limited to Nominatim's
+/// 1 req/s policy on the backend, so multiple users sharing a place
+/// only cost one upstream request.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/osm/lookup",
+    tag = "OSM",
+    params(
+        ("osm_ids" = String, Query, description = "Comma-separated OSM IDs in `N123,W456,R789` form"),
+    ),
+    responses(
+        (status = 200, description = "Resolved Nominatim entries (one per input ref, in input order)", body = Vec<NominatimLookup>),
+        (status = 400, description = "Malformed osm_ids", body = ApiError)
+    )
+)]
+async fn osm_lookup(
+    State(_ctx): State<PluginContext>,
+    Query(params): Query<OsmLookupQuery>,
+) -> ApiResult<Vec<NominatimLookup>> {
+    let raw = params.osm_ids.trim();
+    if raw.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    // Parse `N123,W456,R789` into (osm_type, osm_id) pairs. Bad refs
+    // (anything that doesn't start with N/W/R or has a non-numeric
+    // id) get dropped — the response stays tied to the parsed list,
+    // not the raw query, so callers should match by the result's
+    // `osm_type` + `osm_id` fields.
+    let mut refs: Vec<(String, i64)> = Vec::new();
+    for chunk in raw.split(',') {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let (prefix, rest) = chunk.split_at(1);
+        let osm_type = match prefix {
+            "N" => "node",
+            "W" => "way",
+            "R" => "relation",
+            _ => continue,
+        };
+        let Ok(id) = rest.parse::<i64>() else {
+            continue;
+        };
+        refs.push((osm_type.to_string(), id));
+    }
+
+    Ok(Json(batch_lookup_cached(&refs).await))
 }

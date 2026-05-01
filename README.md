@@ -115,6 +115,40 @@ Mounted at `/v0/mapky/` by nexusd. Full schema at
 | `GET` | `/routes/{author_id}/{route_id}/tags` | Tags on a route |
 | `GET` | `/routes/user/{user_id}` | A user's routes |
 | `GET` | `/search/tags?q=` | Tag search across places, collections, posts |
+| `GET` | `/osm/lookup?osm_ids=N1,W2,R3` | Cached batched Nominatim lookup (proxy with Redis) |
+
+### OSM lookup proxy (`/osm/lookup`)
+
+Sits in front of public (or self-hosted) Nominatim so the browser
+doesn't fan out per-POI `/lookup` calls and trip per-IP rate limits.
+A 30-place viewport opens with one upstream request the first time;
+every subsequent user sharing those places hits Redis instead, for
+the configured TTL window.
+
+- Accepts `?osm_ids=N1,W2,R3,…` (Nominatim's input format), up to 50
+  per request — chunks larger inputs internally.
+- Returns one result per input ref in the same order, with empty
+  results (`display_name == ""`) for IDs Nominatim couldn't resolve.
+  Empty results are also cached so a permanently-missing ID doesn't
+  re-hit upstream every time someone asks.
+- `addressdetails` and `extratags` are always included (`payment:*`
+  / `currency:XBT` flags from the BTCMap schema, address fields used
+  by the place card).
+
+#### Configuration
+
+All knobs are environment variables, read once on first call. Restart
+`nexusd` to apply changes.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAPKY_NOMINATIM_URL` | `https://nominatim.openstreetmap.org` | Upstream base URL. Point at a self-hosted mirror for production traffic; the public instance is per-IP rate-limited and not for sustained use per the [OSM usage policy](https://operations.osmfoundation.org/policies/nominatim/). |
+| `MAPKY_OVERPASS_URL` | `https://overpass-api.de/api/interpreter` | Overpass `/interpreter` endpoint. Used as a fallback when Nominatim returns empty for an OSM ref that does exist (typical case: a recently-edited unnamed building with full `addr:*` tags — Nominatim's named-entity index doesn't have it, but Overpass serves the raw OSM tags). Point at a self-hosted instance in production. |
+| `MAPKY_NOMINATIM_MIN_INTERVAL_MS` | `1000` | Floor on inter-request spacing (1 req/s matches Nominatim's policy). Shared with event-time geocoding and the Overpass fallback so all upstream calls compete fairly. |
+| `MAPKY_NOMINATIM_USER_AGENT` | `mapky-nexus-plugin/0.1 (+repo)` | Sent on every upstream call. Set this to something operator-identifiable in production — Nominatim operators sometimes use it to follow up on traffic patterns. |
+| `MAPKY_OSM_CACHE_TTL_SECS` | `2592000` (30 days) | Redis TTL for **resolved** lookups. Lower for datasets you expect to churn; higher for stable production OSM extracts. |
+| `MAPKY_OSM_EMPTY_CACHE_TTL_SECS` | `21600` (6 hours) | Redis TTL for **empty placeholders** — refs neither Nominatim nor Overpass returned data for. Short by design so a recent OSM edit catches up quickly. |
+| `MAPKY_OSM_BATCH_SIZE` | `50` | Max IDs per upstream request. Public Nominatim caps at 50; self-hosted may allow more. |
 
 ### Example
 
