@@ -1,8 +1,27 @@
+> **Pre-release (`0.1.0-alpha.1`).** APIs, schema, and routes may change without
+> notice. Not published to crates.io — consume via git tag (see "Installation").
+
 # mapky-nexus-plugin
 
 A [Pubky Nexus](https://github.com/pubky/pubky-nexus) plugin that indexes
 [MapKy](https://github.com/gillohner/mapky) geo-social content into the shared
 Neo4j graph, exposing a REST API for place reviews, posts, and spatial queries.
+
+## Installation
+
+This crate is **not on crates.io** — the plugin system in `nexus-common` lives
+on a local pubky-nexus fork that hasn't shipped upstream yet, so a published
+copy would be unbuildable. Until upstream catches up, depend on this repo by
+git tag:
+
+```toml
+[dependencies]
+mapky-nexus-plugin = { git = "https://github.com/gillohner/mapky-nexus-plugin", tag = "v0.1.0-alpha.1" }
+```
+
+You also need a sibling checkout of `gillohner/pubky-nexus` (with the
+plugin-system branch) at `../pubky-nexus/` for the path dep on `nexus-common`
+to resolve.
 
 ## Overview
 

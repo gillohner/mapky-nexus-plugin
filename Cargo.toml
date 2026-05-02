@@ -1,13 +1,28 @@
 [package]
 name = "mapky-nexus-plugin"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
-description = "Mapky domain plugin for Nexus — indexes /pub/mapky.app/ events into Neo4j"
+description = "Mapky domain plugin for Pubky Nexus — indexes /pub/mapky.app/ events into Neo4j and exposes a spatial REST API"
+homepage = "https://mapky.app"
+repository = "https://github.com/gillohner/mapky-nexus-plugin"
+readme = "README.md"
 license = "MIT"
+keywords = ["pubky", "nexus", "mapky", "openstreetmap", "neo4j"]
+categories = ["database", "web-programming"]
+
+# Not published to crates.io: depends on `nexus-common` from a local
+# pubky-nexus checkout that hasn't shipped its plugin-system bump
+# upstream yet. Consume via git tag instead — see README.
 
 [dependencies]
+# Path dep — requires a sibling pubky-nexus checkout at
+# ../../pubky-nexus/. This crate is not publishable to crates.io
+# until upstream pubky-nexus ships nexus-common with the plugin
+# system.
 nexus-common = { path = "../../pubky-nexus/nexus-common" }
-mapky-app-specs = { path = "../mapky-app-specs" }
+# Path + version: local dev resolves through the sibling checkout,
+# git consumers pull mapky-app-specs 0.1.0-alpha.1 from crates.io.
+mapky-app-specs = { path = "../mapky-app-specs", version = "0.1.0-alpha.1" }
 async-trait = "0.1.89"
 axum = "0.8.8"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
@@ -29,6 +44,10 @@ futures = "0.3"
 mapky-app-specs = { path = "../mapky-app-specs" }
 nexus-watcher = { path = "../../pubky-nexus/nexus-watcher", features = ["testing"] }
 pubky = "0.7.0"
+# Same git rev as the local pubky-nexus workspace pins, so
+# nexus-watcher's testing harness and our test bodies share one
+# `pubky-app-specs` resolution — otherwise `PubkyAppUser` becomes
+# "two different versions of the same type" inside tests.
 pubky-app-specs = { git = "https://github.com/pubky/pubky-app-specs.git", rev = "bf78fe845ef55e96984a3bea954b69053fa7e8af" }
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-shared-rt = "0.1"
@@ -36,3 +55,13 @@ tokio-shared-rt = "0.1"
 [[example]]
 name = "write_testnet"
 path = "examples/write_testnet.rs"
+
+# Force the published `mapky-app-specs`' transitive `pubky-app-specs
+# = "0.4"` (which would otherwise pull from crates.io) onto the same
+# git rev that local pubky-nexus pins. Without this, our prod path
+# resolves a third copy of `pubky-app-specs` (crates.io 0.4.3) and
+# any prod handler that hands a struct to a nexus-common helper
+# fails E0308. The patch is local-only; downstream git consumers
+# resolve fresh from crates.io.
+[patch.crates-io]
+pubky-app-specs = { git = "https://github.com/pubky/pubky-app-specs.git", rev = "bf78fe845ef55e96984a3bea954b69053fa7e8af" }
