@@ -48,7 +48,9 @@ pub async fn sync_put(
     }
 
     let review_details = ReviewDetails::from_mapky_review(review, user_id, review_id);
-    graph.run(queries::put::create_review(&review_details)).await?;
+    graph
+        .run(queries::put::create_review(&review_details))
+        .await?;
 
     graph
         .run(queries::put::increment_place_rating(

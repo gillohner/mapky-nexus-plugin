@@ -14,11 +14,11 @@ pub mod routing;
 
 use axum::Router;
 use mapky_app_specs::MapkyAppObject;
-use utoipa::OpenApi;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::plugin::{NexusPlugin, PluginContext, PluginManifest};
 use nexus_common::types::DynError;
 use tracing::{debug, warn};
+use utoipa::OpenApi;
 
 pub struct MapkyPlugin;
 
@@ -38,7 +38,7 @@ impl Default for MapkyPlugin {
 pub fn split_resource(path: &str) -> Option<(&str, &str)> {
     let after_app = path.strip_prefix("/pub/mapky.app/")?;
     let slash = after_app.find('/')?;
-    let resource_type = &after_app[..slash];  // e.g. "posts"
+    let resource_type = &after_app[..slash]; // e.g. "posts"
     let resource_id = &after_app[slash + 1..]; // e.g. "0034TK01CC73G"
     if resource_id.is_empty() {
         return None;
@@ -81,8 +81,8 @@ impl NexusPlugin for MapkyPlugin {
         user_id: &str,
         _ctx: &PluginContext,
     ) -> Result<(), DynError> {
-        let path = extract_pub_path(uri)
-            .ok_or_else(|| format!("Cannot extract path from URI: {uri}"))?;
+        let path =
+            extract_pub_path(uri).ok_or_else(|| format!("Cannot extract path from URI: {uri}"))?;
         let (resource_type, resource_id) = split_resource(path)
             .ok_or_else(|| format!("Cannot split resource from path: {path}"))?;
 
@@ -142,8 +142,8 @@ impl NexusPlugin for MapkyPlugin {
         user_id: &str,
         _ctx: &PluginContext,
     ) -> Result<(), DynError> {
-        let path = extract_pub_path(uri)
-            .ok_or_else(|| format!("Cannot extract path from URI: {uri}"))?;
+        let path =
+            extract_pub_path(uri).ok_or_else(|| format!("Cannot extract path from URI: {uri}"))?;
         let (resource_type, resource_id) = split_resource(path)
             .ok_or_else(|| format!("Cannot split resource from path: {path}"))?;
 

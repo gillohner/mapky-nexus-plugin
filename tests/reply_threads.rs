@@ -20,8 +20,7 @@ use std::sync::Arc;
 
 #[tokio_shared_rt::test(shared)]
 async fn test_pubky_post_reply_to_review() -> Result<()> {
-    let mut test =
-        WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
+    let mut test = WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
 
     // ── Step 1: Create a user ──────────────────────────────────────────────────
     let user_kp = Keypair::random();
@@ -58,8 +57,7 @@ async fn test_pubky_post_reply_to_review() -> Result<()> {
         None,
     );
     let reply_id = reply.create_id();
-    let reply_path: pubky::ResourcePath =
-        format!("/pub/mapky.app/posts/{reply_id}").parse()?;
+    let reply_path: pubky::ResourcePath = format!("/pub/mapky.app/posts/{reply_id}").parse()?;
     test.put(&user_kp, &reply_path, &reply).await?;
 
     let reply_compound = format!("{user_id}:{reply_id}");
@@ -77,7 +75,10 @@ async fn test_pubky_post_reply_to_review() -> Result<()> {
         )
         .await?;
     let row = stream.try_next().await?;
-    assert!(row.is_some(), "Dual-labeled :Post:MapkyAppPost should exist");
+    assert!(
+        row.is_some(),
+        "Dual-labeled :Post:MapkyAppPost should exist"
+    );
     let row = row.unwrap();
     let namespace: String = row.get("namespace")?;
     let parent_uri: String = row.get("parent_uri")?;
@@ -105,8 +106,7 @@ async fn test_pubky_post_reply_to_review() -> Result<()> {
     // ── Step 6: Cross-domain parent — author another post pointing at a
     //          /pub/pubky.app/posts/ URI. Edge should NOT be created, but the
     //          parent_uri property must persist. ──────────────────────────────
-    let cross_domain_parent =
-        format!("pubky://{user_id}/pub/pubky.app/posts/0034A0X7NJ52G");
+    let cross_domain_parent = format!("pubky://{user_id}/pub/pubky.app/posts/0034A0X7NJ52G");
     let cross_post = PubkyAppPost::new(
         "x-domain reply".to_string(),
         PubkyAppPostKind::Short,
@@ -115,8 +115,7 @@ async fn test_pubky_post_reply_to_review() -> Result<()> {
         None,
     );
     let cross_id = cross_post.create_id();
-    let cross_path: pubky::ResourcePath =
-        format!("/pub/mapky.app/posts/{cross_id}").parse()?;
+    let cross_path: pubky::ResourcePath = format!("/pub/mapky.app/posts/{cross_id}").parse()?;
     test.put(&user_kp, &cross_path, &cross_post).await?;
     let cross_compound = format!("{user_id}:{cross_id}");
 

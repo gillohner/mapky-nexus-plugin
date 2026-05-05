@@ -18,10 +18,10 @@ on:
         required: false
         type: string
       pubky_nexus_ref:
-        description: "pubky-nexus ref (default: master)"
+        description: "pubky-nexus ref (default: main, the upstream default branch)"
         required: false
         type: string
-        default: master
+        default: main
       app_specs_ref:
         description: "mapky-app-specs ref (default: master)"
         required: false
@@ -59,9 +59,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: pubky/pubky-nexus
-          ref: ${{ inputs.pubky_nexus_ref || 'master' }}
+          # Default branch on pubky/pubky-nexus is `main`; older defaults of
+          # `master` would 404 the fetch.
+          ref: ${{ inputs.pubky_nexus_ref || 'main' }}
           path: pubky-nexus
-          # Submodules off — pubky-nexus has none, and we don't want surprises.
 
       - name: Checkout mapky-app-specs
         uses: actions/checkout@v4

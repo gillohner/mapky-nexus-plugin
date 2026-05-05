@@ -4,8 +4,8 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures::TryStreamExt;
-use mapky_app_specs::MapkyAppReview;
 use mapky_app_specs::traits::{HasIdPath, TimestampId};
+use mapky_app_specs::MapkyAppReview;
 use mapky_nexus_plugin::MapkyPlugin;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::db::graph::Query;
@@ -17,8 +17,7 @@ use std::sync::Arc;
 
 #[tokio_shared_rt::test(shared)]
 async fn test_pubky_tag_on_mapky_review() -> Result<()> {
-    let mut test =
-        WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
+    let mut test = WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
 
     // ── Step 1: Create a user ──────────────────────────────────────────────────
     let user_kp = Keypair::random();

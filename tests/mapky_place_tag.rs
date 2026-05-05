@@ -5,8 +5,8 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures::TryStreamExt;
-use mapky_app_specs::MapkyAppReview;
 use mapky_app_specs::traits::{HasIdPath, TimestampId};
+use mapky_app_specs::MapkyAppReview;
 use mapky_nexus_plugin::MapkyPlugin;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::db::graph::Query;
@@ -18,8 +18,7 @@ use std::sync::Arc;
 
 #[tokio_shared_rt::test(shared)]
 async fn test_tag_on_osm_place() -> Result<()> {
-    let mut test =
-        WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
+    let mut test = WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
 
     let user_kp = Keypair::random();
     let user = PubkyAppUser {
@@ -33,12 +32,7 @@ async fn test_tag_on_osm_place() -> Result<()> {
 
     // First create a review so the Place node exists (via Nominatim geocoding).
     let osm_url = "https://www.openstreetmap.org/node/1573053883";
-    let review = MapkyAppReview::new(
-        osm_url.to_string(),
-        8,
-        Some("Nice place".to_string()),
-        None,
-    );
+    let review = MapkyAppReview::new(osm_url.to_string(), 8, Some("Nice place".to_string()), None);
     let review_id = review.create_id();
     let review_path: pubky::ResourcePath = MapkyAppReview::create_path(&review_id).parse()?;
     test.put(&user_kp, &review_path, &review).await?;
@@ -46,13 +40,11 @@ async fn test_tag_on_osm_place() -> Result<()> {
     // Verify Place exists.
     let graph = get_neo4j_graph()?;
     let mut stream = graph
-        .execute(
-            Query::new(
-                "test_place_exists",
-                "MATCH (p:Place {osm_canonical: 'node/1573053883'})
+        .execute(Query::new(
+            "test_place_exists",
+            "MATCH (p:Place {osm_canonical: 'node/1573053883'})
                  RETURN p.tag_count AS tag_count",
-            ),
-        )
+        ))
         .await?;
     let row = stream.try_next().await?;
     assert!(row.is_some(), "Place should exist after review indexing");

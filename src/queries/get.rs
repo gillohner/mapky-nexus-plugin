@@ -21,13 +21,15 @@ impl PlaceFilters {
     fn cypher_clause(&self) -> &'static str {
         match (self.bitcoin, self.reviewed, self.tagged) {
             (false, false, false) => "",
-            (true,  false, false) => " AND p.accepts_bitcoin = true",
-            (false, true,  false) => " AND p.review_count > 0",
-            (false, false, true ) => " AND p.tag_count > 0",
-            (true,  true,  false) => " AND p.accepts_bitcoin = true AND p.review_count > 0",
-            (true,  false, true ) => " AND p.accepts_bitcoin = true AND p.tag_count > 0",
-            (false, true,  true ) => " AND p.review_count > 0 AND p.tag_count > 0",
-            (true,  true,  true ) => " AND p.accepts_bitcoin = true AND p.review_count > 0 AND p.tag_count > 0",
+            (true, false, false) => " AND p.accepts_bitcoin = true",
+            (false, true, false) => " AND p.review_count > 0",
+            (false, false, true) => " AND p.tag_count > 0",
+            (true, true, false) => " AND p.accepts_bitcoin = true AND p.review_count > 0",
+            (true, false, true) => " AND p.accepts_bitcoin = true AND p.tag_count > 0",
+            (false, true, true) => " AND p.review_count > 0 AND p.tag_count > 0",
+            (true, true, true) => {
+                " AND p.accepts_bitcoin = true AND p.review_count > 0 AND p.tag_count > 0"
+            }
         }
     }
 }

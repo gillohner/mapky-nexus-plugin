@@ -95,9 +95,8 @@ pub async fn sync_put(data: &[u8], tagger_user_id: &str, tag_id: &str) -> Result
         let uri_owner_id = crate::extract_user_id(&tag.uri)
             .ok_or_else(|| format!("Cannot extract user_id from tag URI: {}", tag.uri))?;
 
-        let node_label = neo4j_label_for(resource_type).ok_or_else(|| {
-            format!("Unknown mapky resource type for tagging: {resource_type}")
-        })?;
+        let node_label = neo4j_label_for(resource_type)
+            .ok_or_else(|| format!("Unknown mapky resource type for tagging: {resource_type}"))?;
 
         let compound_id = format!("{uri_owner_id}:{resource_id}");
 
