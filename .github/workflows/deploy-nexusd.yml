@@ -1,0 +1,184 @@
+name: Build & deploy nexusd (with mapky plugin)
+
+# Triggers when this plugin cuts a tagged release. Builds nexusd from
+# pubky-nexus master with the plugin tag pinned + mapky-app-specs at the
+# matching tag (or master if no matching tag exists), then rsyncs the
+# binary to the VPS and restarts the systemd service.
+#
+# Manual dispatch lets you redeploy without cutting a new tag, or override
+# the pubky-nexus / mapky-app-specs refs — handy when upstream pubky-nexus
+# ships a fix and you want it picked up without bumping the plugin tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      plugin_ref:
+        description: "mapky-nexus-plugin ref (defaults to release tag / current branch)"
+        required: false
+        type: string
+      pubky_nexus_ref:
+        description: "pubky-nexus ref (default: master)"
+        required: false
+        type: string
+        default: master
+      app_specs_ref:
+        description: "mapky-app-specs ref (default: master)"
+        required: false
+        type: string
+        default: master
+
+concurrency:
+  # Serialize: two simultaneous nexusd restarts would hit the same systemd unit.
+  group: deploy-nexusd
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Resolve plugin ref
+        id: plugin
+        run: |
+          ref="${{ inputs.plugin_ref }}"
+          if [ -z "$ref" ]; then ref="${{ github.event.release.tag_name }}"; fi
+          if [ -z "$ref" ]; then ref="${{ github.ref_name }}"; fi
+          tag="${ref//[^A-Za-z0-9._-]/_}"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Plugin ref: $ref (tag: $tag)"
+
+      # ── Three checkouts in a sibling layout matching pubky-nexus's path
+      #    deps: nexusd/Cargo.toml has
+      #    `mapky-nexus-plugin = { path = "../../mapky/mapky-nexus-plugin" }`
+      #    and the plugin's Cargo.toml has
+      #    `mapky-app-specs = { path = "../mapky-app-specs" }`. The workflow
+      #    creates that exact tree under `${{ github.workspace }}`.
+      - name: Checkout pubky-nexus
+        uses: actions/checkout@v4
+        with:
+          repository: pubky/pubky-nexus
+          ref: ${{ inputs.pubky_nexus_ref || 'master' }}
+          path: pubky-nexus
+          # Submodules off — pubky-nexus has none, and we don't want surprises.
+
+      - name: Checkout mapky-app-specs
+        uses: actions/checkout@v4
+        with:
+          repository: gillohner/mapky-app-specs
+          ref: ${{ inputs.app_specs_ref || 'master' }}
+          path: mapky/mapky-app-specs
+
+      - name: Checkout mapky-nexus-plugin (this repo, at release ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.plugin.outputs.ref }}
+          path: mapky/mapky-nexus-plugin
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pubky-nexus -> pubky-nexus/target
+
+      - name: Build nexusd (release, with mapky feature)
+        working-directory: pubky-nexus
+        run: |
+          cargo build --release --features mapky --bin nexusd
+          ls -la target/release/nexusd
+          file target/release/nexusd
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: First-deploy guard
+        # The legacy mapky-nexus.service still binds 127.0.0.1:8090. If it's
+        # running, our restart of nexusd.service will fail to bind. Detect that
+        # state and fail loudly with cutover instructions instead of leaving a
+        # half-broken state — the user has to disable the legacy service once
+        # before deploys can take over.
+        env:
+          SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+        run: |
+          set +e
+          status=$(ssh -i ~/.ssh/deploy -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" \
+            "systemctl is-active mapky-nexus.service 2>/dev/null || true")
+          set -e
+          if [ "$status" = "active" ]; then
+            cat >&2 <<'MSG'
+          ──────────────────────────────────────────────────────────────────
+          Legacy mapky-nexus.service is still running on 127.0.0.1:8090.
+          Run the one-time cutover on the VPS before redeploying:
+
+            sudo rsync -a /home/mapky/apps/nexus-data/static/files/ \
+                          /srv/nexusd/data/static/files/
+            sudo chown -R deploy:deploy /srv/nexusd/data
+            sudo systemctl disable --now mapky-nexus.service
+
+          Then re-run this workflow.
+          ──────────────────────────────────────────────────────────────────
+          MSG
+            exit 1
+          fi
+
+      - name: Upload binary + restart
+        env:
+          SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          TAG: ${{ steps.plugin.outputs.tag }}
+        run: |
+          set -euo pipefail
+          REMOTE_REL="/srv/nexusd/releases/${TAG}"
+
+          ssh -i ~/.ssh/deploy -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" \
+            "mkdir -p '${REMOTE_REL}'"
+
+          rsync -az --chmod=F0755 \
+            -e "ssh -i ~/.ssh/deploy -p ${SSH_PORT}" \
+            pubky-nexus/target/release/nexusd \
+            "${SSH_USER}@${SSH_HOST}:${REMOTE_REL}/nexusd"
+
+          ssh -i ~/.ssh/deploy -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" bash -se <<EOF
+          set -euo pipefail
+          ln -sfn '${REMOTE_REL}' /srv/nexusd/current.new
+          mv -Tf /srv/nexusd/current.new /srv/nexusd/current
+          ls -1dt /srv/nexusd/releases/*/ 2>/dev/null \
+            | tail -n +6 \
+            | xargs -r rm -rf
+          sudo /usr/bin/systemctl restart nexusd
+          EOF
+
+      - name: Health check (nexus.mapky.app/v0/info)
+        run: |
+          # 30 s warmup window: nexusd boots the watcher, applies Neo4j
+          # schema, kicks off BTCMap sync — /v0/info is up well before any of
+          # that finishes but we still allow some slack.
+          for i in $(seq 1 15); do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" https://nexus.mapky.app/v0/info || echo 000)
+            echo "attempt $i: $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 2
+          done
+          echo "Health check failed — /v0/info did not return 200" >&2
+          # Capture the tail of the unit log so the workflow output explains why.
+          ssh -i ~/.ssh/deploy -p "$SSH_PORT" \
+              "${{ secrets.DEPLOY_SSH_USER }}@${{ secrets.DEPLOY_SSH_HOST }}" \
+              'journalctl -u nexusd --no-pager -n 80' || true
+          exit 1
+        env:
+          SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
