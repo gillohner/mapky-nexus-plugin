@@ -4,7 +4,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::TryStreamExt;
@@ -21,8 +21,10 @@ use crate::models::post::PostDetails;
 use crate::models::route::RouteDetails;
 use crate::models::sequence::SequenceDetails;
 use crate::models::tag::PostTagDetails;
-use crate::osm::{batch_lookup_cached, NominatimLookup};
+use crate::btcmap_sync::{self, SyncStatus};
+use crate::osm::{batch_lookup_cached, reverse_cached, search_cached, NominatimLookup, SearchParams};
 use crate::queries;
+use crate::routing::{self as routing_proxy, RouteOutcome};
 
 pub fn routes(ctx: PluginContext) -> Router {
     Router::new()
@@ -89,6 +91,13 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/search/tags", get(search_tags))
         // ── OSM auxiliary services ──
         .route("/osm/lookup", get(osm_lookup))
+        .route("/osm/search", get(osm_search))
+        .route("/osm/reverse", get(osm_reverse))
+        // ── BTC POI overlay (BTCMap-sourced) ──
+        .route("/btc/viewport", get(btc_viewport))
+        .route("/btc/status", get(btc_status))
+        // ── Cached routing proxy ──
+        .route("/routing/valhalla", post(routing_valhalla))
         .with_state(ctx)
 }
 
@@ -104,6 +113,8 @@ pub fn routes(ctx: PluginContext) -> Router {
         (name = "Route", description = "Routes and trails"),
         (name = "Search", description = "Cross-resource search"),
         (name = "OSM", description = "Cached Nominatim lookups (rate-limited proxy)"),
+        (name = "BTC", description = "BTCMap-derived Bitcoin-accepting places"),
+        (name = "Routing", description = "Cached proxy for Valhalla routing"),
     ),
     paths(
         viewport, place_detail, place_posts, place_tags, place_routes,
@@ -115,13 +126,20 @@ pub fn routes(ctx: PluginContext) -> Router {
         routes_viewport, route_detail, route_tags, user_routes,
         search_tags,
         osm_lookup,
+        osm_search,
+        osm_reverse,
+        btc_viewport,
+        btc_status,
+        routing_valhalla,
     ),
     components(schemas(
         PlaceDetails, PostDetails, PostTagDetails,
         IncidentDetails, GeoCaptureDetails, SequenceDetails, CollectionDetails, RouteDetails,
-        ViewportQuery, PostsQuery, PaginationQuery, NearbyQuery,
+        ViewportQuery, PlaceViewportQuery, PostsQuery, PaginationQuery, NearbyQuery,
         TagSearchQuery, TagSearchResponse,
-        OsmLookupQuery, NominatimLookup,
+        OsmLookupQuery, OsmSearchQuery, OsmReverseQuery, NominatimLookup,
+        BitcoinPoi, SyncStatus,
+        PlaceCluster, ViewportResponse,
     ))
 )]
 pub struct MapkyApiDoc;
@@ -136,6 +154,37 @@ pub struct ViewportQuery {
     pub max_lon: f64,
     #[serde(default = "default_limit")]
     pub limit: i64,
+}
+
+/// Place-viewport query — adds zoom + optional filter flags so the
+/// handler can decide between cluster and individual rendering and
+/// narrow the result without a second round-trip.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct PlaceViewportQuery {
+    pub min_lat: f64,
+    pub min_lon: f64,
+    pub max_lat: f64,
+    pub max_lon: f64,
+    /// Current MapLibre zoom (0-22). Below `CLUSTER_ZOOM_THRESHOLD`
+    /// the response is `{kind:"clusters"}`; at or above, individual
+    /// places. Defaults to a high zoom when omitted so legacy callers
+    /// without a `zoom` param keep getting individual places.
+    #[serde(default = "default_viewport_zoom")]
+    pub zoom: u8,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    /// Filter pills — when `true`, narrow to the matching set.
+    /// All-`false` (the default) means "show every place".
+    #[serde(default)]
+    pub bitcoin: bool,
+    #[serde(default)]
+    pub reviewed: bool,
+    #[serde(default)]
+    pub tagged: bool,
+}
+
+fn default_viewport_zoom() -> u8 {
+    13
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -198,6 +247,106 @@ pub struct OsmLookupQuery {
     pub osm_ids: String,
 }
 
+/// Query for the cached `/osm/search` proxy. Subset of Nominatim's
+/// `/search` params — only the knobs the frontend uses.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct OsmSearchQuery {
+    pub q: String,
+    /// `west,north,east,south`. Optional viewport bias / restriction.
+    #[serde(default)]
+    pub viewbox: Option<String>,
+    /// Combined with `viewbox`, restricts results to the box.
+    #[serde(default)]
+    pub bounded: bool,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+    #[serde(default = "default_true")]
+    pub dedupe: bool,
+    #[serde(default)]
+    pub addressdetails: bool,
+}
+
+fn default_search_limit() -> u32 {
+    8
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Query for the cached `/osm/reverse` proxy. `zoom` defaults to
+/// Nominatim's standard 18 (street-level).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct OsmReverseQuery {
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(default = "default_reverse_zoom")]
+    pub zoom: u32,
+}
+
+fn default_reverse_zoom() -> u32 {
+    18
+}
+
+/// One row from the cluster aggregation. Carries enough sub-counts
+/// for the frontend to draw a per-cluster ratio bar (BTC / reviewed /
+/// tagged) without a second query.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PlaceCluster {
+    pub lat: f64,
+    pub lon: f64,
+    pub total: i64,
+    pub btc: i64,
+    pub reviewed: i64,
+    pub tagged: i64,
+}
+
+/// Discriminated envelope for the place-viewport endpoint. The frontend
+/// switches between cluster bubbles (low zoom) and individual balloons
+/// (high zoom) based on `kind`. One shape, one query key, no client-
+/// side guesswork about which mode the server picked.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ViewportResponse {
+    /// `zoom < cluster_zoom_threshold` — a grid-aggregated overview.
+    Clusters {
+        clusters: Vec<PlaceCluster>,
+        /// Cell size (degrees) used for binning, echoed back so the
+        /// client can render bin-aware tooltips ("places in this 1°×1° area").
+        cell: f64,
+    },
+    /// `zoom >= cluster_zoom_threshold` — individual place markers.
+    Places { places: Vec<PlaceDetails> },
+}
+
+/// MapLibre zoom at or above which we switch from cluster bubbles to
+/// individual place balloons. Below this, viewports are wide enough
+/// that hundreds of POIs would clutter the map; above, a metro/city
+/// fits in the viewport and the user wants per-place detail.
+///
+/// 11 is roughly "showing the whole city" — at z=11 a viewport spans
+/// ~20km, comfortably small enough to render every BTC POI as an
+/// individual balloon while still letting the user see the layout.
+/// Below z=11 we cluster to keep continent/country views readable.
+const CLUSTER_ZOOM_THRESHOLD: u8 = 11;
+
+/// Cluster cell size (degrees of lat/lon) for the given MapLibre
+/// zoom. Continuous formula (`45 / 2^zoom`) keyed to viewport width:
+/// at any zoom, ~8 cells fit across the visible viewport, so the
+/// frontend's ClusterBubble grid stays evenly spaced regardless of
+/// how zoomed-out the user is.
+///
+/// Spot values:
+///   z=0  → 45°    (world view: ~6-8 populated cells globally)
+///   z=4  → 2.8°
+///   z=8  → 0.18°
+///   z=10 → 0.044°
+fn cluster_cell_for_zoom(zoom: u8) -> f64 {
+    // Cap the shift so well-behaved math even at unrealistic zooms.
+    let z = zoom.min(20);
+    45.0 / ((1u32 << z) as f64)
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct TagSearchResponse {
     pub places: Vec<PlaceDetails>,
@@ -228,6 +377,31 @@ fn graph_err(e: impl ToString) -> (StatusCode, Json<ApiError>) {
             error: e.to_string(),
         }),
     )
+}
+
+/// Read a `:Place` row produced by any of the Place-returning queries
+/// (viewport, get-by-id, search). All such queries share the same
+/// projection — defined in `queries::get` and kept in sync with the
+/// `PlaceDetails` struct shape.
+fn place_details_from_row(row: &neo4rs::Row) -> PlaceDetails {
+    PlaceDetails {
+        osm_canonical: row.get("osm_canonical").unwrap_or_default(),
+        osm_type: row.get("osm_type").unwrap_or_default(),
+        osm_id: row.get("osm_id").unwrap_or(0),
+        lat: row.get("lat").unwrap_or(0.0),
+        lon: row.get("lon").unwrap_or(0.0),
+        geocoded: row.get("geocoded").unwrap_or(false),
+        review_count: row.get("review_count").unwrap_or(0),
+        avg_rating: row.get("avg_rating").unwrap_or(0.0),
+        tag_count: row.get("tag_count").unwrap_or(0),
+        photo_count: row.get("photo_count").unwrap_or(0),
+        indexed_at: row.get("indexed_at").unwrap_or(0),
+        name: row.get("name").ok(),
+        accepts_bitcoin: row.get("accepts_bitcoin").unwrap_or(false),
+        btc_onchain: row.get("btc_onchain").unwrap_or(false),
+        btc_lightning: row.get("btc_lightning").unwrap_or(false),
+        btc_lightning_contactless: row.get("btc_lightning_contactless").unwrap_or(false),
+    }
 }
 
 /// Execute a `get_tags_for_*` query and aggregate rows into `(found, Vec<PostTagDetails>)`.
@@ -271,7 +445,16 @@ async fn fetch_tags(
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
-/// List places within a geographic bounding box
+/// Places within a geographic bounding box.
+///
+/// Returns a discriminated envelope: cluster bubbles when the zoom is
+/// wide enough that individual balloons would clutter the map, and
+/// individual `PlaceDetails` once the user is zoomed in. The frontend
+/// switches rendering modes off the `kind` discriminator, so the
+/// transition between zoom levels is seamless.
+///
+/// Optional `bitcoin` / `reviewed` / `tagged` flags narrow the result
+/// in both modes — same Cypher predicates either way.
 #[utoipa::path(
     get,
     path = "/v0/mapky/viewport",
@@ -281,49 +464,79 @@ async fn fetch_tags(
         ("min_lon" = f64, Query, description = "Minimum longitude"),
         ("max_lat" = f64, Query, description = "Maximum latitude"),
         ("max_lon" = f64, Query, description = "Maximum longitude"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 100)")
+        ("zoom" = Option<u8>, Query, description = "Current MapLibre zoom (0-22). Switches to cluster mode below 13."),
+        ("limit" = Option<i64>, Query, description = "Max rows (clusters or places); default 100"),
+        ("bitcoin" = Option<bool>, Query, description = "Narrow to Bitcoin-accepting places"),
+        ("reviewed" = Option<bool>, Query, description = "Narrow to places with at least one review"),
+        ("tagged" = Option<bool>, Query, description = "Narrow to places with at least one tag"),
     ),
     responses(
-        (status = 200, description = "List of places in viewport", body = Vec<PlaceDetails>),
+        (status = 200, description = "Cluster summary or individual places", body = ViewportResponse),
         (status = 500, description = "Internal server error", body = ApiError)
     )
 )]
 async fn viewport(
     State(_ctx): State<PluginContext>,
-    Query(params): Query<ViewportQuery>,
-) -> ApiResult<Vec<PlaceDetails>> {
+    Query(params): Query<PlaceViewportQuery>,
+) -> ApiResult<ViewportResponse> {
     let graph = get_neo4j_graph().map_err(graph_err)?;
+    let filters = queries::get::PlaceFilters {
+        bitcoin: params.bitcoin,
+        reviewed: params.reviewed,
+        tagged: params.tagged,
+    };
 
+    if params.zoom >= CLUSTER_ZOOM_THRESHOLD {
+        // High-zoom path — return individual balloons. Same shape the
+        // frontend's PlaceAnnotationsLayer has always rendered, plus
+        // the new `accepts_bitcoin` / btc_* / name fields baked in by
+        // place_details_from_row.
+        let mut stream = graph
+            .execute(queries::get::get_places_in_viewport(
+                params.min_lat,
+                params.min_lon,
+                params.max_lat,
+                params.max_lon,
+                filters,
+                params.limit,
+            ))
+            .await
+            .map_err(graph_err)?;
+
+        let mut places = Vec::new();
+        while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+            places.push(place_details_from_row(&row));
+        }
+        return Ok(Json(ViewportResponse::Places { places }));
+    }
+
+    // Low-zoom path — bin places into a cell-sized grid and aggregate.
+    let cell = cluster_cell_for_zoom(params.zoom);
     let mut stream = graph
-        .execute(queries::get::get_places_in_viewport(
+        .execute(queries::get::get_place_clusters_in_viewport(
             params.min_lat,
             params.min_lon,
             params.max_lat,
             params.max_lon,
+            cell,
+            filters,
             params.limit,
         ))
         .await
         .map_err(graph_err)?;
 
-    let mut places = Vec::new();
+    let mut clusters = Vec::new();
     while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        let place = PlaceDetails {
-            osm_canonical: row.get("osm_canonical").unwrap_or_default(),
-            osm_type: row.get("osm_type").unwrap_or_default(),
-            osm_id: row.get("osm_id").unwrap_or(0),
+        clusters.push(PlaceCluster {
             lat: row.get("lat").unwrap_or(0.0),
             lon: row.get("lon").unwrap_or(0.0),
-            geocoded: row.get("geocoded").unwrap_or(false),
-            review_count: row.get("review_count").unwrap_or(0),
-            avg_rating: row.get("avg_rating").unwrap_or(0.0),
-            tag_count: row.get("tag_count").unwrap_or(0),
-            photo_count: row.get("photo_count").unwrap_or(0),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-        };
-        places.push(place);
+            total: row.get("total").unwrap_or(0),
+            btc: row.get("btc").unwrap_or(0),
+            reviewed: row.get("reviewed").unwrap_or(0),
+            tagged: row.get("tagged").unwrap_or(0),
+        });
     }
-
-    Ok(Json(places))
+    Ok(Json(ViewportResponse::Clusters { clusters, cell }))
 }
 
 /// Get a single place by OSM type and ID
@@ -354,22 +567,7 @@ async fn place_detail(
         .map_err(graph_err)?;
 
     match stream.try_next().await.map_err(graph_err)? {
-        Some(row) => {
-            let place = PlaceDetails {
-                osm_canonical: row.get("osm_canonical").unwrap_or_default(),
-                osm_type: row.get("osm_type").unwrap_or_default(),
-                osm_id: row.get("osm_id").unwrap_or(0),
-                lat: row.get("lat").unwrap_or(0.0),
-                lon: row.get("lon").unwrap_or(0.0),
-                geocoded: row.get("geocoded").unwrap_or(false),
-                review_count: row.get("review_count").unwrap_or(0),
-                avg_rating: row.get("avg_rating").unwrap_or(0.0),
-                tag_count: row.get("tag_count").unwrap_or(0),
-                photo_count: row.get("photo_count").unwrap_or(0),
-                indexed_at: row.get("indexed_at").unwrap_or(0),
-            };
-            Ok(Json(place))
-        }
+        Some(row) => Ok(Json(place_details_from_row(&row))),
         None => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError {
@@ -1751,19 +1949,7 @@ async fn search_tags(
         .await
         .map_err(graph_err)?;
     while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        places.push(PlaceDetails {
-            osm_canonical: row.get("osm_canonical").unwrap_or_default(),
-            osm_type: row.get("osm_type").unwrap_or_default(),
-            osm_id: row.get("osm_id").unwrap_or(0),
-            lat: row.get("lat").unwrap_or(0.0),
-            lon: row.get("lon").unwrap_or(0.0),
-            geocoded: row.get("geocoded").unwrap_or(false),
-            review_count: row.get("review_count").unwrap_or(0),
-            avg_rating: row.get("avg_rating").unwrap_or(0.0),
-            tag_count: row.get("tag_count").unwrap_or(0),
-            photo_count: row.get("photo_count").unwrap_or(0),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-        });
+        places.push(place_details_from_row(&row));
     }
 
     // Search collections by tag
@@ -1877,4 +2063,226 @@ async fn osm_lookup(
     }
 
     Ok(Json(batch_lookup_cached(&refs).await))
+}
+
+/// Cached free-text search proxy.
+///
+/// Returns the same shape as `/osm/lookup` (a `NominatimLookup` list),
+/// minus `extratags` for the search shape. Cached in Redis with
+/// versioned keys; the upstream call shares the same 1 req/s gate as
+/// the lookup pipeline so search and lookup never collide.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/osm/search",
+    tag = "OSM",
+    params(
+        ("q" = String, Query, description = "Free-text query"),
+        ("viewbox" = Option<String>, Query, description = "`west,north,east,south` bias / restriction"),
+        ("bounded" = Option<bool>, Query, description = "Restrict to viewbox (requires viewbox)"),
+        ("limit" = Option<u32>, Query, description = "Max results, default 8"),
+        ("dedupe" = Option<bool>, Query, description = "Drop near-duplicate results, default true"),
+        ("addressdetails" = Option<bool>, Query, description = "Include `address` map, default false"),
+    ),
+    responses(
+        (status = 200, description = "Matching Nominatim entries", body = Vec<NominatimLookup>)
+    )
+)]
+async fn osm_search(
+    State(_ctx): State<PluginContext>,
+    Query(params): Query<OsmSearchQuery>,
+) -> ApiResult<Vec<NominatimLookup>> {
+    let q = params.q.trim();
+    if q.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let result = search_cached(&SearchParams {
+        q: q.to_string(),
+        viewbox: params.viewbox,
+        bounded: params.bounded,
+        limit: params.limit.clamp(1, 50),
+        dedupe: params.dedupe,
+        addressdetails: params.addressdetails,
+    })
+    .await;
+    Ok(Json(result))
+}
+
+/// Cached reverse-geocode proxy.
+///
+/// Returns the place at `(lat, lon)` or 404 if Nominatim has nothing.
+/// Coordinates are quantized to ~1 m precision for cache key building
+/// so callers within the same metre share a Redis slot — matches the
+/// frontend's `makeReverseKey`.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/osm/reverse",
+    tag = "OSM",
+    params(
+        ("lat" = f64, Query, description = "Latitude"),
+        ("lon" = f64, Query, description = "Longitude"),
+        ("zoom" = Option<u32>, Query, description = "Nominatim zoom (1-18, default 18)"),
+    ),
+    responses(
+        (status = 200, description = "Place at coordinate", body = NominatimLookup),
+        (status = 404, description = "No place at coordinate", body = ApiError)
+    )
+)]
+async fn osm_reverse(
+    State(_ctx): State<PluginContext>,
+    Query(params): Query<OsmReverseQuery>,
+) -> ApiResult<NominatimLookup> {
+    let zoom = params.zoom.clamp(1, 18);
+    match reverse_cached(params.lat, params.lon, zoom).await {
+        Some(hit) => Ok(Json(hit)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("No Nominatim entry at {},{}", params.lat, params.lon),
+            }),
+        )),
+    }
+}
+
+// ── BTC overlay ─────────────────────────────────────────────────────────
+
+/// Bitcoin-accepting POI as served to the frontend BTC overlay.
+///
+/// Mirrors the frontend's `BitcoinPoi` (`mapky-app/src/lib/btcmap/overpass.ts`)
+/// so the type can be consumed unchanged after the network call swaps
+/// from public Overpass to this endpoint.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BitcoinPoi {
+    pub osm_type: String,
+    pub osm_id: i64,
+    pub lat: f64,
+    pub lon: f64,
+    pub name: Option<String>,
+    pub onchain: bool,
+    pub lightning: bool,
+    pub lightning_contactless: bool,
+}
+
+/// List Bitcoin-accepting places within a geographic bounding box.
+///
+/// Served from `:Place` nodes flagged `accepts_bitcoin = true` by the
+/// periodic BTCMap sync (see `btcmap_sync.rs`). No upstream Overpass
+/// call on the request path — sub-100 ms for any user, any region.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/btc/viewport",
+    tag = "BTC",
+    params(
+        ("min_lat" = f64, Query, description = "Minimum latitude"),
+        ("min_lon" = f64, Query, description = "Minimum longitude"),
+        ("max_lat" = f64, Query, description = "Maximum latitude"),
+        ("max_lon" = f64, Query, description = "Maximum longitude"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)")
+    ),
+    responses(
+        (status = 200, description = "Bitcoin-accepting POIs in viewport", body = Vec<BitcoinPoi>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn btc_viewport(
+    State(_ctx): State<PluginContext>,
+    Query(params): Query<ViewportQuery>,
+) -> ApiResult<Vec<BitcoinPoi>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+
+    let mut stream = graph
+        .execute(queries::get::get_btc_places_in_viewport(
+            params.min_lat,
+            params.min_lon,
+            params.max_lat,
+            params.max_lon,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut places = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        places.push(BitcoinPoi {
+            osm_type: row.get("osm_type").unwrap_or_default(),
+            osm_id: row.get("osm_id").unwrap_or(0),
+            lat: row.get("lat").unwrap_or(0.0),
+            lon: row.get("lon").unwrap_or(0.0),
+            name: row.get("name").ok(),
+            onchain: row.get("btc_onchain").unwrap_or(false),
+            lightning: row.get("btc_lightning").unwrap_or(false),
+            lightning_contactless: row.get("btc_lightning_contactless").unwrap_or(false),
+        });
+    }
+
+    Ok(Json(places))
+}
+
+/// Inspect BTCMap sync state: configured upstream URL, refresh
+/// interval, last successful sync timestamp, whether a sync is
+/// currently running. Cheap call, two Redis GETs.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/btc/status",
+    tag = "BTC",
+    responses(
+        (status = 200, description = "Current BTCMap sync state", body = SyncStatus)
+    )
+)]
+async fn btc_status(State(_ctx): State<PluginContext>) -> ApiResult<SyncStatus> {
+    Ok(Json(btcmap_sync::read_status().await))
+}
+
+// ── Cached Valhalla routing ─────────────────────────────────────────────
+
+/// Cached Valhalla `/route` proxy.
+///
+/// Body is the standard Valhalla request envelope (locations, costing,
+/// costing_options, alternates, directions_options). Response is
+/// passthrough — same JSON the upstream returned, but cached in Redis
+/// keyed by a content hash of the request.
+///
+/// The hash is canonical (object key order doesn't matter), so two
+/// frontends serializing the same request differently still hit the
+/// same cache entry.
+#[utoipa::path(
+    post,
+    path = "/v0/mapky/routing/valhalla",
+    tag = "Routing",
+    request_body(
+        description = "Valhalla `/route` request",
+        content_type = "application/json"
+    ),
+    responses(
+        (status = 200, description = "Snapped route — passthrough Valhalla response"),
+        (status = 429, description = "Upstream rate-limited", body = ApiError),
+        (status = 502, description = "Upstream error or unreachable", body = ApiError)
+    )
+)]
+async fn routing_valhalla(
+    State(_ctx): State<PluginContext>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<serde_json::Value> {
+    match routing_proxy::route(body).await {
+        RouteOutcome::Ok(value) => Ok(Json(value)),
+        RouteOutcome::Upstream { status, body } => {
+            // Forward the upstream status when we recognize it, so the
+            // frontend's existing 429 handling (friendly rate-limit
+            // message) stays intact.
+            let mapped = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            Err((mapped, Json(ApiError { error: body })))
+        }
+        RouteOutcome::Network(msg) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                // Most operational hits here are the public FOSSGIS
+                // instance going down. The env-var hint nudges the
+                // operator at a self-hosted Valhalla without making
+                // them grep the code.
+                error: format!(
+                    "Valhalla upstream unreachable: {msg}. \
+                     Set MAPKY_VALHALLA_URL to a self-hosted /route endpoint."
+                ),
+            }),
+        )),
+    }
 }

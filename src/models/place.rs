@@ -1,40 +1,10 @@
 //! Place model — an OSM element stored as a Neo4j `:Place` node.
 
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
 use chrono::Utc;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing::warn;
 
-/// Public Nominatim API — 1 request/second hard limit per usage policy.
-const NOMINATIM_URL: &str = "https://nominatim.openstreetmap.org";
-const NOMINATIM_MIN_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Shared HTTP client — built once, reused across all geocoding calls.
-fn nominatim_client() -> &'static Client {
-    static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        Client::builder()
-            .user_agent("mapky-nexus-plugin/0.1 (+https://github.com/gillohner/mapky)")
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build Nominatim HTTP client")
-    })
-}
-
-/// Global rate-limit gate. All geocoding calls serialize through this mutex
-/// and sleep until 1 s has elapsed since the previous request, ensuring we
-/// never exceed Nominatim's 1 req/s policy even under concurrent event load.
-fn nominatim_rate_limiter() -> &'static Mutex<Instant> {
-    static LAST_REQUEST: OnceLock<Mutex<Instant>> = OnceLock::new();
-    LAST_REQUEST.get_or_init(|| {
-        // Subtract the interval so the first request fires immediately.
-        Mutex::new(Instant::now() - NOMINATIM_MIN_INTERVAL)
-    })
-}
+use crate::osm::{nominatim_client, nominatim_url, wait_for_rate_limit};
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaceDetails {
@@ -52,6 +22,28 @@ pub struct PlaceDetails {
     pub tag_count: i64,
     pub photo_count: i64,
     pub indexed_at: i64,
+    /// Optional display name; populated when the place was first seen via
+    /// the BTCMap sync job (BTCMap dumps include the OSM `name` tag).
+    /// User-driven places leave this `None` and rely on Nominatim lookups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `true` when this place accepts Bitcoin (any of currency:XBT,
+    /// payment:bitcoin, payment:onchain, payment:lightning).
+    /// Maintained by the BTCMap sync job; cleared when a place drops out
+    /// of BTCMap. Not set for user-driven places that haven't been
+    /// cross-referenced.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub accepts_bitcoin: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub btc_onchain: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub btc_lightning: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub btc_lightning_contactless: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl PlaceDetails {
@@ -68,6 +60,11 @@ impl PlaceDetails {
             tag_count: 0,
             photo_count: 0,
             indexed_at: Utc::now().timestamp_millis(),
+            name: None,
+            accepts_bitcoin: false,
+            btc_onchain: false,
+            btc_lightning: false,
+            btc_lightning_contactless: false,
         }
     }
 
@@ -115,6 +112,10 @@ struct NominatimResult {
 }
 
 /// Fetch coordinates from Nominatim, blocking behind the global rate limiter.
+///
+/// Shares the HTTP client and rate-limit gate with `osm.rs::batch_lookup_cached`,
+/// so event-time geocoding and API-time `/osm/lookup` calls never double up
+/// against Nominatim's policy.
 async fn resolve_osm_coords(osm_type: &str, osm_id: i64) -> Option<(f64, f64)> {
     let type_char = match osm_type {
         "node" => 'N',
@@ -123,18 +124,12 @@ async fn resolve_osm_coords(osm_type: &str, osm_id: i64) -> Option<(f64, f64)> {
         _ => return None,
     };
 
-    // Enforce the 1 req/s limit. All callers queue here; each holds the lock
-    // only long enough to update the timestamp, so no request is skipped.
-    {
-        let mut last = nominatim_rate_limiter().lock().await;
-        let elapsed = last.elapsed();
-        if elapsed < NOMINATIM_MIN_INTERVAL {
-            tokio::time::sleep(NOMINATIM_MIN_INTERVAL - elapsed).await;
-        }
-        *last = Instant::now();
-    }
+    wait_for_rate_limit().await;
 
-    let url = format!("{NOMINATIM_URL}/lookup?osm_ids={type_char}{osm_id}&format=json");
+    let url = format!(
+        "{}/lookup?osm_ids={type_char}{osm_id}&format=json",
+        nominatim_url()
+    );
     let results: Vec<NominatimResult> = nominatim_client()
         .get(&url)
         .send()

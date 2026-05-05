@@ -2,23 +2,54 @@
 
 use nexus_common::db::graph::Query;
 
-/// Fetch Place nodes within a lat/lon bounding box.
+/// Filters layered on top of the bbox. Each one when `true` narrows
+/// the result to places that satisfy the predicate. All-`false` means
+/// "no narrowing" and the query returns every geocoded place in bbox.
+///
+/// Kept as a struct (rather than positional bools) so the call sites
+/// stay readable when we add another filter dimension later.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaceFilters {
+    pub bitcoin: bool,
+    pub reviewed: bool,
+    pub tagged: bool,
+}
+
+impl PlaceFilters {
+    /// Build the Cypher fragment that AND's onto the base bbox WHERE.
+    /// Empty when no filters are active so the simple case stays clean.
+    fn cypher_clause(&self) -> &'static str {
+        match (self.bitcoin, self.reviewed, self.tagged) {
+            (false, false, false) => "",
+            (true,  false, false) => " AND p.accepts_bitcoin = true",
+            (false, true,  false) => " AND p.review_count > 0",
+            (false, false, true ) => " AND p.tag_count > 0",
+            (true,  true,  false) => " AND p.accepts_bitcoin = true AND p.review_count > 0",
+            (true,  false, true ) => " AND p.accepts_bitcoin = true AND p.tag_count > 0",
+            (false, true,  true ) => " AND p.review_count > 0 AND p.tag_count > 0",
+            (true,  true,  true ) => " AND p.accepts_bitcoin = true AND p.review_count > 0 AND p.tag_count > 0",
+        }
+    }
+}
+
+/// Fetch individual Place nodes within a lat/lon bounding box.
+/// High-zoom path: the frontend is showing balloons, not clusters.
 pub fn get_places_in_viewport(
     min_lat: f64,
     min_lon: f64,
     max_lat: f64,
     max_lon: f64,
+    filters: PlaceFilters,
     limit: i64,
 ) -> Query {
-    Query::new(
-        "mapky_viewport",
+    let cypher = format!(
         "MATCH (p:Place)
          WHERE p.geocoded = true
            AND point.withinBBox(
              p.location,
-             point({latitude: $min_lat, longitude: $min_lon}),
-             point({latitude: $max_lat, longitude: $max_lon})
-         )
+             point({{latitude: $min_lat, longitude: $min_lon}}),
+             point({{latitude: $max_lat, longitude: $max_lon}})
+         ){filters}
          RETURN p.osm_canonical AS osm_canonical,
                 p.osm_type AS osm_type,
                 p.osm_id AS osm_id,
@@ -29,7 +60,102 @@ pub fn get_places_in_viewport(
                 p.avg_rating AS avg_rating,
                 p.tag_count AS tag_count,
                 p.photo_count AS photo_count,
-                p.indexed_at AS indexed_at
+                p.indexed_at AS indexed_at,
+                p.name AS name,
+                coalesce(p.accepts_bitcoin, false) AS accepts_bitcoin,
+                coalesce(p.btc_onchain, false) AS btc_onchain,
+                coalesce(p.btc_lightning, false) AS btc_lightning,
+                coalesce(p.btc_lightning_contactless, false) AS btc_lightning_contactless
+         LIMIT $limit",
+        filters = filters.cypher_clause()
+    );
+    Query::new("mapky_viewport", &cypher)
+        .param("min_lat", min_lat)
+        .param("min_lon", min_lon)
+        .param("max_lat", max_lat)
+        .param("max_lon", max_lon)
+        .param("limit", limit)
+}
+
+/// Cluster Place nodes into a `cell`-sized lat/lon grid and aggregate.
+///
+/// `cell` is in degrees; the frontend picks a value based on the
+/// current zoom (smaller cells at higher zoom). Each cluster carries
+/// total count + per-filter sub-counts so the UI can render the BTC /
+/// reviewed / tagged ratios inside the bubble without a second query.
+///
+/// Returns at most `limit` clusters ordered by `total` desc, so dense
+/// areas (cities) are guaranteed to appear before empty cells.
+pub fn get_place_clusters_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    cell: f64,
+    filters: PlaceFilters,
+    limit: i64,
+) -> Query {
+    let cypher = format!(
+        "MATCH (p:Place)
+         WHERE p.geocoded = true
+           AND point.withinBBox(
+             p.location,
+             point({{latitude: $min_lat, longitude: $min_lon}}),
+             point({{latitude: $max_lat, longitude: $max_lon}})
+         ){filters}
+         WITH p,
+              floor(p.lat / $cell) AS lat_idx,
+              floor(p.lon / $cell) AS lon_idx
+         WITH lat_idx, lon_idx,
+              count(p) AS total,
+              sum(CASE WHEN coalesce(p.accepts_bitcoin, false) THEN 1 ELSE 0 END) AS btc,
+              sum(CASE WHEN p.review_count > 0 THEN 1 ELSE 0 END) AS reviewed,
+              sum(CASE WHEN p.tag_count > 0 THEN 1 ELSE 0 END) AS tagged,
+              avg(p.lat) AS lat,
+              avg(p.lon) AS lon
+         RETURN lat, lon, total, btc, reviewed, tagged
+         ORDER BY total DESC
+         LIMIT $limit",
+        filters = filters.cypher_clause()
+    );
+    Query::new("mapky_viewport_clusters", &cypher)
+        .param("min_lat", min_lat)
+        .param("min_lon", min_lon)
+        .param("max_lat", max_lat)
+        .param("max_lon", max_lon)
+        .param("cell", cell)
+        .param("limit", limit)
+}
+
+/// Fetch Bitcoin-accepting Place nodes within a lat/lon bounding box.
+/// Filters on `accepts_bitcoin = true`; relies on the same `Place.location`
+/// point index as the generic viewport query.
+pub fn get_btc_places_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    limit: i64,
+) -> Query {
+    Query::new(
+        "mapky_btc_viewport",
+        "MATCH (p:Place)
+         WHERE p.accepts_bitcoin = true
+           AND p.geocoded = true
+           AND point.withinBBox(
+             p.location,
+             point({latitude: $min_lat, longitude: $min_lon}),
+             point({latitude: $max_lat, longitude: $max_lon})
+         )
+         RETURN p.osm_canonical AS osm_canonical,
+                p.osm_type AS osm_type,
+                p.osm_id AS osm_id,
+                p.lat AS lat,
+                p.lon AS lon,
+                p.name AS name,
+                coalesce(p.btc_onchain, false) AS btc_onchain,
+                coalesce(p.btc_lightning, false) AS btc_lightning,
+                coalesce(p.btc_lightning_contactless, false) AS btc_lightning_contactless
          LIMIT $limit",
     )
     .param("min_lat", min_lat)
@@ -54,7 +180,12 @@ pub fn get_place_by_canonical(osm_canonical: &str) -> Query {
                 p.avg_rating AS avg_rating,
                 p.tag_count AS tag_count,
                 p.photo_count AS photo_count,
-                p.indexed_at AS indexed_at",
+                p.indexed_at AS indexed_at,
+                p.name AS name,
+                coalesce(p.accepts_bitcoin, false) AS accepts_bitcoin,
+                coalesce(p.btc_onchain, false) AS btc_onchain,
+                coalesce(p.btc_lightning, false) AS btc_lightning,
+                coalesce(p.btc_lightning_contactless, false) AS btc_lightning_contactless",
     )
     .param("osm_canonical", osm_canonical)
 }
@@ -727,7 +858,12 @@ pub fn search_places_by_tag(query_str: &str, limit: i64) -> Query {
                 p.avg_rating AS avg_rating,
                 p.tag_count AS tag_count,
                 p.photo_count AS photo_count,
-                p.indexed_at AS indexed_at",
+                p.indexed_at AS indexed_at,
+                p.name AS name,
+                coalesce(p.accepts_bitcoin, false) AS accepts_bitcoin,
+                coalesce(p.btc_onchain, false) AS btc_onchain,
+                coalesce(p.btc_lightning, false) AS btc_lightning,
+                coalesce(p.btc_lightning_contactless, false) AS btc_lightning_contactless",
     )
     .param("query", query_str)
     .param("limit", limit)
