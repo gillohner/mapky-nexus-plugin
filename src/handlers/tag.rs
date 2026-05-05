@@ -26,8 +26,10 @@ use crate::queries;
 const OSM_URL_PREFIX: &str = "https://www.openstreetmap.org/";
 
 /// Map a mapky resource type to its Neo4j node label.
+/// Kept in lockstep with `handlers::mapky_post::mapky_resource_label`.
 fn neo4j_label_for(resource_type: &str) -> Option<&'static str> {
     match resource_type {
+        "reviews" => Some("MapkyAppReview"),
         "posts" => Some("MapkyAppPost"),
         "collections" => Some("MapkyAppCollection"),
         "incidents" => Some("MapkyAppIncident"),

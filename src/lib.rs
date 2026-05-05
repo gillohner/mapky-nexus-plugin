@@ -35,7 +35,7 @@ impl Default for MapkyPlugin {
 }
 
 /// Split `/pub/mapky.app/posts/0034TK01CC73G` into `("posts", "0034TK01CC73G")`.
-pub(crate) fn split_resource(path: &str) -> Option<(&str, &str)> {
+pub fn split_resource(path: &str) -> Option<(&str, &str)> {
     let after_app = path.strip_prefix("/pub/mapky.app/")?;
     let slash = after_app.find('/')?;
     let resource_type = &after_app[..slash];  // e.g. "posts"
@@ -47,7 +47,7 @@ pub(crate) fn split_resource(path: &str) -> Option<(&str, &str)> {
 }
 
 /// Extract `/pub/mapky.app/...` from `pubky://{user_id}/pub/mapky.app/...`.
-pub(crate) fn extract_pub_path(uri: &str) -> Option<&str> {
+pub fn extract_pub_path(uri: &str) -> Option<&str> {
     let without_scheme = uri.strip_prefix("pubky://")?;
     let slash = without_scheme.find('/')?;
     let path = &without_scheme[slash..];
@@ -59,7 +59,7 @@ pub(crate) fn extract_pub_path(uri: &str) -> Option<&str> {
 }
 
 /// Extract `user_id` from `pubky://{user_id}/pub/...`.
-pub(crate) fn extract_user_id(uri: &str) -> Option<&str> {
+pub fn extract_user_id(uri: &str) -> Option<&str> {
     let without_scheme = uri.strip_prefix("pubky://")?;
     let slash = without_scheme.find('/')?;
     Some(&without_scheme[..slash])
@@ -86,10 +86,16 @@ impl NexusPlugin for MapkyPlugin {
         let (resource_type, resource_id) = split_resource(path)
             .ok_or_else(|| format!("Cannot split resource from path: {path}"))?;
 
-        // Infrastructure types — handle before MapkyAppObject dispatch.
+        // Infrastructure / cross-namespace types — handle before MapkyAppObject dispatch.
         match resource_type {
             "tags" => {
                 handlers::tag::sync_put(data, user_id, resource_id).await?;
+                return Ok(());
+            }
+            "posts" => {
+                // PubkyAppPost blobs reused as-is for threaded comments under
+                // the MapKy namespace (mirrors the universal-tags pattern).
+                handlers::mapky_post::sync_put(data, user_id, resource_id).await?;
                 return Ok(());
             }
             // files and blobs are handled by nexus core's universal file handler
@@ -107,8 +113,8 @@ impl NexusPlugin for MapkyPlugin {
         };
 
         match object {
-            MapkyAppObject::Post(post) => {
-                handlers::post::sync_put(&post, user_id, resource_id).await?;
+            MapkyAppObject::Review(review) => {
+                handlers::review::sync_put(&review, user_id, resource_id).await?;
             }
             MapkyAppObject::Collection(collection) => {
                 handlers::collection::sync_put(&collection, user_id, resource_id).await?;
@@ -147,8 +153,11 @@ impl NexusPlugin for MapkyPlugin {
             }
             // files and blobs are handled by nexus core's universal file handler
             "files" | "blobs" => {}
+            "reviews" => {
+                handlers::review::del(user_id, resource_id).await?;
+            }
             "posts" => {
-                handlers::post::del(user_id, resource_id).await?;
+                handlers::mapky_post::del(user_id, resource_id).await?;
             }
             "incidents" => {
                 handlers::incident::del(user_id, resource_id).await?;
@@ -196,7 +205,17 @@ impl NexusPlugin for MapkyPlugin {
                 "CREATE POINT INDEX mapky_place_location IF NOT EXISTS \
                  FOR (p:Place) ON (p.location)",
             ),
-            // ── MapkyAppPost ──
+            // ── MapkyAppReview ──
+            (
+                "mapky_schema_review_unique",
+                "CREATE CONSTRAINT mapky_review_unique IF NOT EXISTS \
+                 FOR (r:MapkyAppReview) REQUIRE r.id IS UNIQUE",
+            ),
+            // ── MapkyAppPost (dual-labeled :Post:MapkyAppPost — cross-namespace comments) ──
+            // The constraint targets the MapkyAppPost label specifically so it doesn't
+            // conflict with core's `:Post.id` constraint. Compound IDs (`author:id`)
+            // contain a `:` which bare core IDs never do, so the two constraint domains
+            // never collide.
             (
                 "mapky_schema_post_unique",
                 "CREATE CONSTRAINT mapky_post_unique IF NOT EXISTS \

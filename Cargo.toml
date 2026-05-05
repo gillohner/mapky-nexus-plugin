@@ -1,6 +1,6 @@
 [package]
 name = "mapky-nexus-plugin"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 edition = "2021"
 description = "Mapky domain plugin for Pubky Nexus — indexes /pub/mapky.app/ events into Neo4j and exposes a spatial REST API"
 homepage = "https://mapky.app"
@@ -22,7 +22,7 @@ categories = ["database", "web-programming"]
 nexus-common = { path = "../../pubky-nexus/nexus-common" }
 # Path + version: local dev resolves through the sibling checkout,
 # git consumers pull mapky-app-specs 0.1.0-alpha.1 from crates.io.
-mapky-app-specs = { path = "../mapky-app-specs", version = "0.1.0-alpha.1" }
+mapky-app-specs = { path = "../mapky-app-specs", version = "0.2.0-alpha.1" }
 async-trait = "0.1.89"
 axum = "0.8.8"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }

@@ -13,11 +13,13 @@ use nexus_common::plugin::PluginContext;
 use serde::{Deserialize, Serialize};
 use utoipa::OpenApi;
 
+use crate::handlers::mapky_post::mapky_resource_label;
 use crate::models::collection::CollectionDetails;
 use crate::models::geo_capture::GeoCaptureDetails;
 use crate::models::incident::IncidentDetails;
+use crate::models::mapky_post::MapkyPostDetails;
 use crate::models::place::PlaceDetails;
-use crate::models::post::PostDetails;
+use crate::models::review::ReviewDetails;
 use crate::models::route::RouteDetails;
 use crate::models::sequence::SequenceDetails;
 use crate::models::tag::PostTagDetails;
@@ -31,12 +33,21 @@ pub fn routes(ctx: PluginContext) -> Router {
         // ── Place ──
         .route("/viewport", get(viewport))
         .route("/place/{osm_type}/{osm_id}", get(place_detail))
+        .route("/place/{osm_type}/{osm_id}/reviews", get(place_reviews))
         .route("/place/{osm_type}/{osm_id}/posts", get(place_posts))
         .route("/place/{osm_type}/{osm_id}/tags", get(place_tags))
         .route("/place/{osm_type}/{osm_id}/routes", get(place_routes))
-        // ── Post ──
+        // ── Review ──
+        .route("/reviews/{author_id}/{review_id}/tags", get(review_tags))
+        .route("/reviews/user/{user_id}", get(user_reviews))
+        // ── Post (cross-namespace PubkyAppPost stored at /pub/mapky.app/posts/) ──
         .route("/posts/{author_id}/{post_id}/tags", get(post_tags))
         .route("/posts/user/{user_id}", get(user_posts))
+        // ── Replies — `:MapkyAppPost` nodes whose `[:REPLY_TO]` targets the resource ──
+        .route(
+            "/{resource_type}/{author_id}/{resource_id}/posts",
+            get(resource_replies),
+        )
         // ── Incident ──
         .route("/incidents/viewport", get(incidents_viewport))
         .route("/incidents/{author_id}/{incident_id}", get(incident_detail))
@@ -117,8 +128,9 @@ pub fn routes(ctx: PluginContext) -> Router {
         (name = "Routing", description = "Cached proxy for Valhalla routing"),
     ),
     paths(
-        viewport, place_detail, place_posts, place_tags, place_routes,
-        post_tags, user_posts,
+        viewport, place_detail, place_reviews, place_posts, place_tags, place_routes,
+        review_tags, user_reviews,
+        post_tags, user_posts, resource_replies,
         incidents_viewport, incident_detail, user_incidents,
         geo_captures_viewport, geo_capture_detail, geo_capture_tags, user_geo_captures, nearby_geo_captures,
         sequence_detail, sequence_tags, sequence_captures, user_sequences,
@@ -133,7 +145,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         routing_valhalla,
     ),
     components(schemas(
-        PlaceDetails, PostDetails, PostTagDetails,
+        PlaceDetails, ReviewDetails, MapkyPostDetails, PostTagDetails,
         IncidentDetails, GeoCaptureDetails, SequenceDetails, CollectionDetails, RouteDetails,
         ViewportQuery, PlaceViewportQuery, PostsQuery, PaginationQuery, NearbyQuery,
         TagSearchQuery, TagSearchResponse,
@@ -193,8 +205,6 @@ pub struct PostsQuery {
     pub skip: i64,
     #[serde(default = "default_limit")]
     pub limit: i64,
-    #[serde(default)]
-    pub reviews_only: bool,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -351,8 +361,12 @@ fn cluster_cell_for_zoom(zoom: u8) -> f64 {
 pub struct TagSearchResponse {
     pub places: Vec<PlaceDetails>,
     pub collections: Vec<CollectionDetails>,
-    pub posts: Vec<PostDetails>,
+    pub reviews: Vec<ReviewDetails>,
+    pub posts: Vec<MapkyPostDetails>,
     pub routes: Vec<RouteDetails>,
+    pub geo_captures: Vec<GeoCaptureDetails>,
+    pub sequences: Vec<SequenceDetails>,
+    pub incidents: Vec<IncidentDetails>,
 }
 
 /// Strip the `author_id:` prefix from a compound Neo4j post id, returning just the short post_id.
@@ -577,7 +591,90 @@ async fn place_detail(
     }
 }
 
-/// Get tags for a MapkyAppPost
+/// Read a `:MapkyAppPost` (cross-namespace comment) row produced by any of the
+/// post-returning queries. All such queries share the same projection — kept
+/// in sync with the `MapkyPostDetails` struct shape.
+fn mapky_post_from_row(row: &neo4rs::Row) -> MapkyPostDetails {
+    let compound_id: String = row.get("id").unwrap_or_default();
+    MapkyPostDetails {
+        id: short_post_id(&compound_id),
+        author_id: row.get("author_id").unwrap_or_default(),
+        content: row.get("content").unwrap_or_default(),
+        kind: row.get("kind").unwrap_or_else(|_| "short".to_string()),
+        parent_uri: row.get("parent_uri").ok(),
+        attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
+        embed_uri: row.get("embed_uri").ok(),
+        embed_kind: row.get("embed_kind").ok(),
+        indexed_at: row.get("indexed_at").unwrap_or(0),
+    }
+}
+
+/// Read a `:MapkyAppReview` row produced by any of the review-returning
+/// queries.
+fn review_from_row(row: &neo4rs::Row) -> ReviewDetails {
+    let compound_id: String = row.get("id").unwrap_or_default();
+    let rating_raw: i64 = row.get("rating").unwrap_or(0);
+    ReviewDetails {
+        id: short_post_id(&compound_id),
+        author_id: row.get("author_id").unwrap_or_default(),
+        osm_canonical: row.get("osm_canonical").unwrap_or_default(),
+        content: row.get("content").ok(),
+        rating: rating_raw.clamp(0, u8::MAX as i64) as u8,
+        attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
+        indexed_at: row.get("indexed_at").unwrap_or(0),
+    }
+}
+
+/// Aggregate `(label, tagger_id)` rows into deduplicated `PostTagDetails`.
+async fn collect_resource_tags(
+    node_label: &str,
+    compound_id: &str,
+) -> Result<Vec<PostTagDetails>, (StatusCode, Json<ApiError>)> {
+    use std::collections::HashMap;
+
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_tags_for_mapky_resource(
+            node_label,
+            compound_id,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut found = false;
+    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        found = true;
+        let label: Option<String> = row.get("label").ok();
+        let tagger_id: Option<String> = row.get("tagger_id").ok();
+        if let (Some(l), Some(t)) = (label, tagger_id) {
+            tag_map.entry(l).or_default().push(t);
+        }
+    }
+
+    if !found {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("{node_label} {compound_id} not found"),
+            }),
+        ));
+    }
+
+    Ok(tag_map
+        .into_iter()
+        .map(|(label, taggers)| {
+            let taggers_count = taggers.len();
+            PostTagDetails {
+                label,
+                taggers,
+                taggers_count,
+            }
+        })
+        .collect())
+}
+
+/// Tags on a cross-namespace MapkyAppPost (`/pub/mapky.app/posts/{id}`)
 #[utoipa::path(
     get,
     path = "/v0/mapky/posts/{author_id}/{post_id}/tags",
@@ -596,53 +693,36 @@ async fn post_tags(
     State(_ctx): State<PluginContext>,
     Path((author_id, post_id)): Path<(String, String)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
-    use std::collections::HashMap;
-
     let compound_id = format!("{author_id}:{post_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-
-    let mut stream = graph
-        .execute(queries::get::get_tags_for_mapky_post(&compound_id))
-        .await
-        .map_err(graph_err)?;
-
-    let mut found = false;
-    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
-
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        found = true;
-        let label: Option<String> = row.get("label").ok();
-        let tagger_id: Option<String> = row.get("tagger_id").ok();
-        if let (Some(l), Some(t)) = (label, tagger_id) {
-            tag_map.entry(l).or_default().push(t);
-        }
-    }
-
-    if !found {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("Post {compound_id} not found"),
-            }),
-        ));
-    }
-
-    let tags: Vec<PostTagDetails> = tag_map
-        .into_iter()
-        .map(|(label, taggers)| {
-            let taggers_count = taggers.len();
-            PostTagDetails {
-                label,
-                taggers,
-                taggers_count,
-            }
-        })
-        .collect();
-
+    let tags = collect_resource_tags("MapkyAppPost", &compound_id).await?;
     Ok(Json(tags))
 }
 
-/// List a user's posts
+/// Tags on a `:MapkyAppReview`
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/reviews/{author_id}/{review_id}/tags",
+    tag = "Review",
+    params(
+        ("author_id" = String, Path, description = "Author's pubky ID"),
+        ("review_id" = String, Path, description = "MapkyAppReview ID"),
+    ),
+    responses(
+        (status = 200, description = "Tags for a MapkyAppReview", body = Vec<PostTagDetails>),
+        (status = 404, description = "Review not found"),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn review_tags(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, review_id)): Path<(String, String)>,
+) -> ApiResult<Vec<PostTagDetails>> {
+    let compound_id = format!("{author_id}:{review_id}");
+    let tags = collect_resource_tags("MapkyAppReview", &compound_id).await?;
+    Ok(Json(tags))
+}
+
+/// List a user's cross-namespace posts (`MapkyAppPost`).
 #[utoipa::path(
     get,
     path = "/v0/mapky/posts/user/{user_id}",
@@ -653,7 +733,7 @@ async fn post_tags(
         ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
     ),
     responses(
-        (status = 200, description = "User's posts", body = Vec<PostDetails>),
+        (status = 200, description = "User's posts", body = Vec<MapkyPostDetails>),
         (status = 500, description = "Internal server error", body = ApiError)
     )
 )]
@@ -661,35 +741,154 @@ async fn user_posts(
     State(_ctx): State<PluginContext>,
     Path(user_id): Path<String>,
     Query(params): Query<PaginationQuery>,
-) -> ApiResult<Vec<PostDetails>> {
+) -> ApiResult<Vec<MapkyPostDetails>> {
     let graph = get_neo4j_graph().map_err(graph_err)?;
     let mut stream = graph
-        .execute(queries::get::get_user_posts(&user_id, params.skip, params.limit))
+        .execute(queries::get::get_user_mapky_posts(
+            &user_id,
+            params.skip,
+            params.limit,
+        ))
         .await
         .map_err(graph_err)?;
 
     let mut posts = Vec::new();
     while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        let rating_raw: Option<i64> = row.get("rating").ok();
-        let rating = rating_raw.and_then(|r| if r > 0 { Some(r as u8) } else { None });
-        let compound_id: String = row.get("id").unwrap_or_default();
-        posts.push(PostDetails {
-            id: short_post_id(&compound_id),
-            author_id: row.get("author_id").unwrap_or_default(),
-            osm_canonical: row.get("osm_canonical").unwrap_or_default(),
-            content: row.get("content").ok(),
-            rating,
-            kind: row.get("kind").unwrap_or_else(|_| "post".to_string()),
-            parent_uri: row.get("parent_uri").ok(),
-            attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-        });
+        posts.push(mapky_post_from_row(&row));
     }
-
     Ok(Json(posts))
 }
 
-/// List posts for a place, optionally filtered to reviews only
+/// List a user's reviews
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/reviews/user/{user_id}",
+    tag = "Review",
+    params(
+        ("user_id" = String, Path, description = "User's pubky ID"),
+        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "User's reviews", body = Vec<ReviewDetails>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn user_reviews(
+    State(_ctx): State<PluginContext>,
+    Path(user_id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> ApiResult<Vec<ReviewDetails>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_user_reviews(
+            &user_id,
+            params.skip,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut reviews = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        reviews.push(review_from_row(&row));
+    }
+    Ok(Json(reviews))
+}
+
+/// List `:MapkyAppPost` replies anchored to any MapKy resource. The
+/// `resource_type` segment is mapped to a Neo4j label (reviews, routes,
+/// collections, geo_captures, sequences, incidents, posts).
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/{resource_type}/{author_id}/{resource_id}/posts",
+    tag = "Post",
+    params(
+        ("resource_type" = String, Path, description = "MapKy resource type: reviews, routes, collections, geo_captures, sequences, incidents, posts"),
+        ("author_id" = String, Path, description = "Author of the resource being replied to"),
+        ("resource_id" = String, Path, description = "ID of the resource being replied to"),
+        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "Replies to the resource", body = Vec<MapkyPostDetails>),
+        (status = 400, description = "Unknown resource_type"),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn resource_replies(
+    State(_ctx): State<PluginContext>,
+    Path((resource_type, author_id, resource_id)): Path<(String, String, String)>,
+    Query(params): Query<PaginationQuery>,
+) -> ApiResult<Vec<MapkyPostDetails>> {
+    let label = mapky_resource_label(&resource_type).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("Unknown resource_type: {resource_type}"),
+            }),
+        )
+    })?;
+    let compound_id = format!("{author_id}:{resource_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_replies_for_resource(
+            label,
+            &compound_id,
+            params.skip,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut replies = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        replies.push(mapky_post_from_row(&row));
+    }
+    Ok(Json(replies))
+}
+
+/// List reviews for a place
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/place/{osm_type}/{osm_id}/reviews",
+    tag = "Place",
+    params(
+        ("osm_type" = String, Path, description = "OSM element type: node, way, or relation"),
+        ("osm_id" = i64, Path, description = "OSM element ID"),
+        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "List of reviews for the place", body = Vec<ReviewDetails>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn place_reviews(
+    State(_ctx): State<PluginContext>,
+    Path((osm_type, osm_id)): Path<(String, i64)>,
+    Query(params): Query<PostsQuery>,
+) -> ApiResult<Vec<ReviewDetails>> {
+    let osm_canonical = format!("{osm_type}/{osm_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_reviews_for_place(
+            &osm_canonical,
+            params.skip,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut reviews = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        reviews.push(review_from_row(&row));
+    }
+    Ok(Json(reviews))
+}
+
+/// List cross-namespace `:MapkyAppPost` (comments) anchored to a place — i.e.
+/// posts whose `[:REPLY_TO]` points at a `:MapkyAppReview` for this place.
 #[utoipa::path(
     get,
     path = "/v0/mapky/place/{osm_type}/{osm_id}/posts",
@@ -699,10 +898,9 @@ async fn user_posts(
         ("osm_id" = i64, Path, description = "OSM element ID"),
         ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
         ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
-        ("reviews_only" = Option<bool>, Query, description = "Return only rated reviews")
     ),
     responses(
-        (status = 200, description = "List of posts for the place", body = Vec<PostDetails>),
+        (status = 200, description = "List of posts for the place", body = Vec<MapkyPostDetails>),
         (status = 500, description = "Internal server error", body = ApiError)
     )
 )]
@@ -710,36 +908,21 @@ async fn place_posts(
     State(_ctx): State<PluginContext>,
     Path((osm_type, osm_id)): Path<(String, i64)>,
     Query(params): Query<PostsQuery>,
-) -> ApiResult<Vec<PostDetails>> {
+) -> ApiResult<Vec<MapkyPostDetails>> {
     let osm_canonical = format!("{osm_type}/{osm_id}");
     let graph = get_neo4j_graph().map_err(graph_err)?;
-
-    let q = if params.reviews_only {
-        queries::get::get_reviews_for_place(&osm_canonical, params.skip, params.limit)
-    } else {
-        queries::get::get_posts_for_place(&osm_canonical, params.skip, params.limit)
-    };
-
-    let mut stream = graph.execute(q).await.map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_mapky_posts_for_place(
+            &osm_canonical,
+            params.skip,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
 
     let mut posts = Vec::new();
     while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        let rating_raw: Option<i64> = row.get("rating").ok();
-        let rating = rating_raw.and_then(|r| if r > 0 { Some(r as u8) } else { None });
-
-        let compound_id: String = row.get("id").unwrap_or_default();
-        let post = PostDetails {
-            id: short_post_id(&compound_id),
-            author_id: row.get("author_id").unwrap_or_default(),
-            osm_canonical: row.get("osm_canonical").unwrap_or_default(),
-            content: row.get("content").ok(),
-            rating,
-            kind: row.get("kind").unwrap_or_else(|_| "post".to_string()),
-            parent_uri: row.get("parent_uri").ok(),
-            attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-        };
-        posts.push(post);
+        posts.push(mapky_post_from_row(&row));
     }
 
     Ok(Json(posts))
@@ -1935,8 +2118,12 @@ async fn search_tags(
         return Ok(Json(TagSearchResponse {
             places: Vec::new(),
             collections: Vec::new(),
+            reviews: Vec::new(),
             posts: Vec::new(),
             routes: Vec::new(),
+            geo_captures: Vec::new(),
+            sequences: Vec::new(),
+            incidents: Vec::new(),
         }));
     }
 
@@ -1974,25 +2161,14 @@ async fn search_tags(
         });
     }
 
-    // Search posts by tag
-    let mut posts = Vec::new();
+    // Search reviews by tag
+    let mut reviews = Vec::new();
     let mut stream = graph
-        .execute(queries::get::search_posts_by_tag(&query_str, params.limit))
+        .execute(queries::get::search_reviews_by_tag(&query_str, params.limit))
         .await
         .map_err(graph_err)?;
     while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        let compound_id: String = row.get("id").unwrap_or_default();
-        posts.push(PostDetails {
-            id: short_post_id(&compound_id),
-            author_id: row.get("author_id").unwrap_or_default(),
-            osm_canonical: row.get("osm_canonical").unwrap_or_default(),
-            content: row.get("content").ok(),
-            rating: row.get::<i64>("rating").ok().map(|r| r as u8),
-            kind: row.get("kind").unwrap_or_default(),
-            parent_uri: row.get("parent_uri").ok(),
-            attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-        });
+        reviews.push(review_from_row(&row));
     }
 
     // Search routes by tag
@@ -2005,11 +2181,76 @@ async fn search_tags(
         routes.push(route_from_row(&row));
     }
 
+    // Search cross-namespace posts by tag
+    let mut posts = Vec::new();
+    let mut stream = graph
+        .execute(queries::get::search_posts_by_tag(&query_str, params.limit))
+        .await
+        .map_err(graph_err)?;
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        posts.push(mapky_post_from_row(&row));
+    }
+
+    // Search geo-captures by tag
+    let mut geo_captures = Vec::new();
+    let mut stream = graph
+        .execute(queries::get::search_geo_captures_by_tag(
+            &query_str,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        geo_captures.push(geo_capture_from_row(&row));
+    }
+
+    // Search sequences by tag
+    let mut sequences = Vec::new();
+    let mut stream = graph
+        .execute(queries::get::search_sequences_by_tag(
+            &query_str,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        sequences.push(sequence_from_row(&row));
+    }
+
+    // Search incidents by tag
+    let mut incidents = Vec::new();
+    let mut stream = graph
+        .execute(queries::get::search_incidents_by_tag(
+            &query_str,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        incidents.push(IncidentDetails {
+            id: row.get("id").unwrap_or_default(),
+            author_id: row.get("author_id").unwrap_or_default(),
+            incident_type: row.get("incident_type").unwrap_or_default(),
+            severity: row.get("severity").unwrap_or_default(),
+            lat: row.get("lat").unwrap_or(0.0),
+            lon: row.get("lon").unwrap_or(0.0),
+            heading: row.get("heading").ok(),
+            description: row.get("description").ok(),
+            attachments: row.get::<Vec<String>>("attachments").unwrap_or_default(),
+            expires_at: row.get("expires_at").ok(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+
     Ok(Json(TagSearchResponse {
         places,
         collections,
+        reviews,
         posts,
         routes,
+        geo_captures,
+        sequences,
+        incidents,
     }))
 }
 

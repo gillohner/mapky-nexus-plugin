@@ -2,24 +2,37 @@
 
 use nexus_common::db::graph::Query;
 
-/// Delete a MapkyAppPost and its relationships.
-/// `compound_id` is the compound key `author_id:post_id`.
-/// Returns `osm_canonical` and `rating` so the caller can roll back aggregates.
-pub fn delete_post(author_id: &str, compound_id: &str) -> Query {
+/// Delete a `:MapkyAppReview` and its relationships.
+/// `compound_id` is the compound key `author_id:review_id`.
+/// Returns `osm_canonical` and `rating` so the caller can roll back the place's
+/// rolling-average aggregate.
+pub fn delete_review(author_id: &str, compound_id: &str) -> Query {
     Query::new(
-        "mapky_delete_post",
-        "MATCH (u:User {id: $author_id})-[:AUTHORED]->(p:MapkyAppPost {id: $compound_id})
-         MATCH (p)-[:ABOUT]->(place:Place)
-         WITH p, place.osm_canonical AS osm_canonical, p.rating AS rating
-         DETACH DELETE p
+        "mapky_delete_review",
+        "MATCH (u:User {id: $author_id})-[:AUTHORED]->(r:MapkyAppReview {id: $compound_id})
+         MATCH (r)-[:ABOUT]->(place:Place)
+         WITH r, place.osm_canonical AS osm_canonical, r.rating AS rating
+         DETACH DELETE r
          RETURN osm_canonical, rating",
     )
     .param("author_id", author_id)
     .param("compound_id", compound_id)
 }
 
+/// Delete a `:Post:MapkyAppPost` (cross-namespace comment) and its relationships.
+/// `compound_id` is the compound key `author_id:post_id`.
+pub fn delete_mapky_post(author_id: &str, compound_id: &str) -> Query {
+    Query::new(
+        "mapky_delete_mapky_post",
+        "MATCH (u:User {id: $author_id})-[:AUTHORED]->(p:MapkyAppPost {id: $compound_id})
+         DETACH DELETE p",
+    )
+    .param("author_id", author_id)
+    .param("compound_id", compound_id)
+}
+
 /// Delete a TAGGED relationship by its `id` property.
-/// Returns the label of the target node (e.g. "Place", "MapkyAppPost") and
+/// Returns the label of the target node (e.g. "Place", "MapkyAppReview") and
 /// the Place `osm_canonical` if the target was a Place (for aggregate rollback).
 pub fn delete_tag(tagger_user_id: &str, tag_id: &str) -> Query {
     Query::new(

@@ -190,19 +190,22 @@ pub fn get_place_by_canonical(osm_canonical: &str) -> Query {
     .param("osm_canonical", osm_canonical)
 }
 
-/// Fetch MapkyPost nodes for a place, most recent first.
-pub fn get_posts_for_place(osm_canonical: &str, skip: i64, limit: i64) -> Query {
+/// Fetch `:MapkyAppPost` (cross-namespace comments) directly anchored to a
+/// place via the `[:ABOUT]` edge — the symmetric anchor to reviews. Replies
+/// to specific resources (reviews, routes, …) are fetched separately via the
+/// `/v0/mapky/{resource_type}/{author}/{id}/posts` endpoint.
+pub fn get_mapky_posts_for_place(osm_canonical: &str, skip: i64, limit: i64) -> Query {
     Query::new(
         "mapky_place_posts",
         "MATCH (u:User)-[:AUTHORED]->(p:MapkyAppPost)-[:ABOUT]->(:Place {osm_canonical: $osm_canonical})
          RETURN p.id AS id,
                 u.id AS author_id,
-                $osm_canonical AS osm_canonical,
                 p.content AS content,
-                p.rating AS rating,
                 p.kind AS kind,
                 p.parent_uri AS parent_uri,
                 p.attachments AS attachments,
+                p.embed_uri AS embed_uri,
+                p.embed_kind AS embed_kind,
                 p.indexed_at AS indexed_at
          ORDER BY p.indexed_at DESC
          SKIP $skip LIMIT $limit",
@@ -221,42 +224,40 @@ pub fn place_exists(osm_canonical: &str) -> Query {
     .param("osm_canonical", osm_canonical)
 }
 
-/// Fetch all TAGGED relationships targeting a MapkyPost.
-/// Returns one row per (tagger, label) pair, plus an `exists` flag.
-/// If the post does not exist, the stream will be empty.
-pub fn get_tags_for_mapky_post(post_id: &str) -> Query {
-    Query::new(
-        "mapky_post_tags",
-        "MATCH (p:MapkyAppPost {id: $post_id})
-         OPTIONAL MATCH (tagger:User)-[tag:TAGGED]->(p)
-         RETURN true AS exists, tag.label AS label, tagger.id AS tagger_id",
-    )
-    .param("post_id", post_id)
+/// Fetch all TAGGED relationships targeting a `:MapkyAppReview` or `:MapkyAppPost`.
+/// `compound_id` is `author_id:resource_id`. `node_label` must be either
+/// `"MapkyAppReview"` or `"MapkyAppPost"` and is plugin-controlled (safe to
+/// interpolate). Returns one row per (tagger, label) pair, plus an `exists`
+/// flag. If the target does not exist, the stream will be empty.
+pub fn get_tags_for_mapky_resource(node_label: &str, compound_id: &str) -> Query {
+    let cypher = format!(
+        "MATCH (n:{node_label} {{id: $id}})
+         OPTIONAL MATCH (tagger:User)-[tag:TAGGED]->(n)
+         RETURN true AS exists, tag.label AS label, tagger.id AS tagger_id"
+    );
+    Query::new("mapky_resource_tags", &cypher).param("id", compound_id)
 }
 
-/// Check if a `MapkyPost` node exists by id.
+/// Check if a node with the given label and id exists.
 /// Used for cross-domain tag/bookmark resolution.
-pub fn mapky_post_exists(post_id: &str) -> Query {
-    Query::new(
-        "mapky_post_exists",
-        "MATCH (p:MapkyAppPost {id: $post_id}) RETURN count(p) > 0 AS exists",
-    )
-    .param("post_id", post_id)
+pub fn mapky_node_exists(node_label: &str, compound_id: &str) -> Query {
+    let cypher = format!("MATCH (n:{node_label} {{id: $id}}) RETURN count(n) > 0 AS exists");
+    Query::new("mapky_node_exists", &cypher).param("id", compound_id)
 }
 
-/// Fetch a user's posts, most recent first.
-pub fn get_user_posts(user_id: &str, skip: i64, limit: i64) -> Query {
+/// Fetch a user's `:MapkyAppPost` (cross-namespace comments), most recent first.
+pub fn get_user_mapky_posts(user_id: &str, skip: i64, limit: i64) -> Query {
     Query::new(
         "mapky_user_posts",
-        "MATCH (u:User {id: $user_id})-[:AUTHORED]->(p:MapkyAppPost)-[:ABOUT]->(place:Place)
+        "MATCH (u:User {id: $user_id})-[:AUTHORED]->(p:MapkyAppPost)
          RETURN p.id AS id,
                 u.id AS author_id,
-                place.osm_canonical AS osm_canonical,
                 p.content AS content,
-                p.rating AS rating,
                 p.kind AS kind,
                 p.parent_uri AS parent_uri,
                 p.attachments AS attachments,
+                p.embed_uri AS embed_uri,
+                p.embed_kind AS embed_kind,
                 p.indexed_at AS indexed_at
          ORDER BY p.indexed_at DESC
          SKIP $skip LIMIT $limit",
@@ -264,6 +265,63 @@ pub fn get_user_posts(user_id: &str, skip: i64, limit: i64) -> Query {
     .param("user_id", user_id)
     .param("skip", skip)
     .param("limit", limit)
+}
+
+/// Fetch a user's `:MapkyAppReview` rows, most recent first.
+pub fn get_user_reviews(user_id: &str, skip: i64, limit: i64) -> Query {
+    Query::new(
+        "mapky_user_reviews",
+        "MATCH (u:User {id: $user_id})-[:AUTHORED]->(r:MapkyAppReview)-[:ABOUT]->(place:Place)
+         RETURN r.id AS id,
+                u.id AS author_id,
+                place.osm_canonical AS osm_canonical,
+                r.content AS content,
+                r.rating AS rating,
+                r.attachments AS attachments,
+                r.indexed_at AS indexed_at
+         ORDER BY r.indexed_at DESC
+         SKIP $skip LIMIT $limit",
+    )
+    .param("user_id", user_id)
+    .param("skip", skip)
+    .param("limit", limit)
+}
+
+/// Fetch the entire `:MapkyAppPost` descendant tree under any MapKy resource.
+/// Uses a variable-length `[:REPLY_TO*]` pattern so the endpoint returns ALL
+/// nested replies in one round-trip — the frontend tree builder then nests
+/// them via each post's `parent_uri` property.
+///
+/// Capped at depth 10 to bound the traversal; in practice threads are far
+/// shallower. `parent_label` and `parent_compound_id` come from plugin code
+/// (path-segment lookup), so interpolating the label into the cypher string
+/// is safe.
+pub fn get_replies_for_resource(
+    parent_label: &str,
+    parent_compound_id: &str,
+    skip: i64,
+    limit: i64,
+) -> Query {
+    let cypher = format!(
+        "MATCH (reply:MapkyAppPost)-[:REPLY_TO*1..10]->(target:{parent_label} {{id: $parent_id}})
+         WITH DISTINCT reply
+         MATCH (u:User)-[:AUTHORED]->(reply)
+         RETURN reply.id AS id,
+                u.id AS author_id,
+                reply.content AS content,
+                reply.kind AS kind,
+                reply.parent_uri AS parent_uri,
+                reply.attachments AS attachments,
+                reply.embed_uri AS embed_uri,
+                reply.embed_kind AS embed_kind,
+                reply.indexed_at AS indexed_at
+         ORDER BY reply.indexed_at DESC
+         SKIP $skip LIMIT $limit"
+    );
+    Query::new("mapky_resource_replies", &cypher)
+        .param("parent_id", parent_compound_id)
+        .param("skip", skip)
+        .param("limit", limit)
 }
 
 /// Fetch a user's incidents, most recent first.
@@ -894,7 +952,29 @@ pub fn search_collections_by_tag(query_str: &str, limit: i64) -> Query {
     .param("limit", limit)
 }
 
-/// Search for MapkyAppPosts tagged with a label that contains the query string.
+/// Search for `:MapkyAppReview` rows tagged with a label that contains the query string.
+pub fn search_reviews_by_tag(query_str: &str, limit: i64) -> Query {
+    Query::new(
+        "mapky_search_reviews_by_tag",
+        "MATCH (tagger:User)-[t:TAGGED]->(review:MapkyAppReview)
+         WHERE t.label CONTAINS $query
+         WITH review, count(DISTINCT tagger) AS tagger_count
+         ORDER BY tagger_count DESC
+         LIMIT $limit
+         MATCH (author:User)-[:AUTHORED]->(review)-[:ABOUT]->(place:Place)
+         RETURN review.id AS id,
+                author.id AS author_id,
+                place.osm_canonical AS osm_canonical,
+                review.content AS content,
+                review.rating AS rating,
+                review.attachments AS attachments,
+                review.indexed_at AS indexed_at",
+    )
+    .param("query", query_str)
+    .param("limit", limit)
+}
+
+/// Search for `:MapkyAppPost` (cross-namespace comments) tagged with a label.
 pub fn search_posts_by_tag(query_str: &str, limit: i64) -> Query {
     Query::new(
         "mapky_search_posts_by_tag",
@@ -903,16 +983,86 @@ pub fn search_posts_by_tag(query_str: &str, limit: i64) -> Query {
          WITH post, count(DISTINCT tagger) AS tagger_count
          ORDER BY tagger_count DESC
          LIMIT $limit
-         MATCH (author:User)-[:AUTHORED]->(post)-[:ABOUT]->(place:Place)
+         MATCH (author:User)-[:AUTHORED]->(post)
          RETURN post.id AS id,
                 author.id AS author_id,
-                place.osm_canonical AS osm_canonical,
                 post.content AS content,
-                post.rating AS rating,
                 post.kind AS kind,
                 post.parent_uri AS parent_uri,
                 post.attachments AS attachments,
+                post.embed_uri AS embed_uri,
+                post.embed_kind AS embed_kind,
                 post.indexed_at AS indexed_at",
+    )
+    .param("query", query_str)
+    .param("limit", limit)
+}
+
+/// Search for `:MapkyAppGeoCapture` rows tagged with a label.
+pub fn search_geo_captures_by_tag(query_str: &str, limit: i64) -> Query {
+    Query::new(
+        "mapky_search_geo_captures_by_tag",
+        "MATCH (tagger:User)-[t:TAGGED]->(g:MapkyAppGeoCapture)
+         WHERE t.label CONTAINS $query
+         WITH g, count(DISTINCT tagger) AS tagger_count
+         ORDER BY tagger_count DESC
+         LIMIT $limit
+         MATCH (u:User)-[:AUTHORED]->(g)
+         RETURN g.id AS id,
+                u.id AS author_id,
+                g.file_uri AS file_uri,
+                g.kind AS kind,
+                g.lat AS lat, g.lon AS lon,
+                g.ele AS ele,
+                g.heading AS heading,
+                g.pitch AS pitch,
+                g.fov AS fov,
+                g.caption AS caption,
+                g.sequence_uri AS sequence_uri,
+                g.sequence_index AS sequence_index,
+                g.captured_at AS captured_at,
+                g.indexed_at AS indexed_at",
+    )
+    .param("query", query_str)
+    .param("limit", limit)
+}
+
+/// Search for `:MapkyAppSequence` rows tagged with a label.
+pub fn search_sequences_by_tag(query_str: &str, limit: i64) -> Query {
+    let cypher = format!(
+        "MATCH (tagger:User)-[t:TAGGED]->(s:MapkyAppSequence)
+         WHERE t.label CONTAINS $query
+         WITH s, count(DISTINCT tagger) AS tagger_count
+         ORDER BY tagger_count DESC
+         LIMIT $limit
+         MATCH (u:User)-[:CAPTURED]->(s)
+         RETURN {SEQUENCE_FIELDS}"
+    );
+    Query::new("mapky_search_sequences_by_tag", &cypher)
+        .param("query", query_str)
+        .param("limit", limit)
+}
+
+/// Search for `:MapkyAppIncident` rows tagged with a label.
+pub fn search_incidents_by_tag(query_str: &str, limit: i64) -> Query {
+    Query::new(
+        "mapky_search_incidents_by_tag",
+        "MATCH (tagger:User)-[t:TAGGED]->(i:MapkyAppIncident)
+         WHERE t.label CONTAINS $query
+         WITH i, count(DISTINCT tagger) AS tagger_count
+         ORDER BY tagger_count DESC
+         LIMIT $limit
+         MATCH (u:User)-[:REPORTED]->(i)
+         RETURN i.id AS id,
+                u.id AS author_id,
+                i.incident_type AS incident_type,
+                i.severity AS severity,
+                i.lat AS lat, i.lon AS lon,
+                i.heading AS heading,
+                i.description AS description,
+                i.attachments AS attachments,
+                i.expires_at AS expires_at,
+                i.indexed_at AS indexed_at",
     )
     .param("query", query_str)
     .param("limit", limit)
@@ -1006,22 +1156,19 @@ pub fn mapky_sequence_exists(compound_id: &str) -> Query {
     .param("id", compound_id)
 }
 
-/// Fetch only review posts (rating > 0) for a place, most recent first.
+/// Fetch `:MapkyAppReview` rows for a place, most recent first.
 pub fn get_reviews_for_place(osm_canonical: &str, skip: i64, limit: i64) -> Query {
     Query::new(
         "mapky_place_reviews",
-        "MATCH (u:User)-[:AUTHORED]->(p:MapkyAppPost)-[:ABOUT]->(:Place {osm_canonical: $osm_canonical})
-         WHERE p.rating IS NOT NULL AND p.rating > 0
-         RETURN p.id AS id,
+        "MATCH (u:User)-[:AUTHORED]->(r:MapkyAppReview)-[:ABOUT]->(:Place {osm_canonical: $osm_canonical})
+         RETURN r.id AS id,
                 u.id AS author_id,
                 $osm_canonical AS osm_canonical,
-                p.content AS content,
-                p.rating AS rating,
-                p.kind AS kind,
-                p.parent_uri AS parent_uri,
-                p.attachments AS attachments,
-                p.indexed_at AS indexed_at
-         ORDER BY p.indexed_at DESC
+                r.content AS content,
+                r.rating AS rating,
+                r.attachments AS attachments,
+                r.indexed_at AS indexed_at
+         ORDER BY r.indexed_at DESC
          SKIP $skip LIMIT $limit",
     )
     .param("osm_canonical", osm_canonical)

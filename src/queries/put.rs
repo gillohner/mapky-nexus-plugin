@@ -1,13 +1,21 @@
 //! Neo4j write queries for the mapky plugin.
 //!
-//! Uses `:MapkyAppPost` label to avoid collision with nexus's existing `:Post` label.
-//! Post identity follows the same compound-key convention as nexus: `author_id:post_id`.
+//! Two distinct post-like node families:
+//! - `:MapkyAppReview` — rating-mandatory, place-anchored, never a reply.
+//! - `:Post:MapkyAppPost` — generic comments and threaded replies.
+//!   Dual-labeled so reply chains share core's `:Post` shape, while the
+//!   `:MapkyAppPost` co-label scopes plugin queries.
+//!
+//! Identity for both follows the same compound-key convention as nexus:
+//! `author_id:resource_id`. Compound IDs always contain a `:` so they can't
+//! collide with bare timestamp IDs that core's `:Post.id` constraint enforces.
 
 use crate::models::collection::CollectionDetails;
 use crate::models::geo_capture::GeoCaptureDetails;
 use crate::models::incident::IncidentDetails;
+use crate::models::mapky_post::MapkyPostDetails;
 use crate::models::place::PlaceDetails;
-use crate::models::post::PostDetails;
+use crate::models::review::ReviewDetails;
 use crate::models::route::RouteDetails;
 use crate::models::sequence::SequenceDetails;
 use nexus_common::db::graph::Query;
@@ -50,46 +58,87 @@ pub fn create_place(place: &PlaceDetails) -> Query {
     .param("indexed_at", place.indexed_at)
 }
 
-/// Create a MapkyAppPost node with AUTHORED and ABOUT relationships.
-/// `post.id` is the compound key `author_id:post_id`.
-pub fn create_post(post: &PostDetails) -> Query {
+/// Create a `:MapkyAppReview` node with AUTHORED and ABOUT relationships.
+/// `review.id` is the compound key `author_id:review_id`.
+pub fn create_review(review: &ReviewDetails) -> Query {
     Query::new(
-        "mapky_create_post",
+        "mapky_create_review",
         "MATCH (author:User {id: $author_id})
          MATCH (place:Place {osm_canonical: $osm_canonical})
-         MERGE (author)-[:AUTHORED]->(p:MapkyAppPost {id: $post_id})
-         MERGE (p)-[:ABOUT]->(place)
+         MERGE (author)-[:AUTHORED]->(r:MapkyAppReview {id: $review_id})
+         MERGE (r)-[:ABOUT]->(place)
+         ON CREATE SET r.indexed_at = $indexed_at
+         SET r.content = $content,
+             r.rating = $rating,
+             r.attachments = $attachments",
+    )
+    .param("author_id", review.author_id.clone())
+    .param("review_id", review.id.clone())
+    .param("osm_canonical", review.osm_canonical.clone())
+    .param("content", review.content.clone().unwrap_or_default())
+    .param("rating", review.rating as i64)
+    .param("attachments", review.attachments.clone())
+    .param("indexed_at", review.indexed_at)
+}
+
+/// Create a dual-labeled `:Post:MapkyAppPost` node with an AUTHORED edge.
+/// `post.id` is the compound key `author_id:post_id`. The compound colon
+/// ensures these IDs don't collide with core's bare-id `:Post.id` uniqueness
+/// constraint (we deliberately do not add our own constraint on `:Post`).
+pub fn create_mapky_post(post: &MapkyPostDetails) -> Query {
+    Query::new(
+        "mapky_create_mapky_post",
+        "MERGE (u:User {id: $author_id})
+         MERGE (u)-[:AUTHORED]->(p:Post:MapkyAppPost {id: $post_id})
          ON CREATE SET p.indexed_at = $indexed_at
          SET p.content = $content,
-             p.rating = $rating,
              p.kind = $kind,
              p.parent_uri = $parent_uri,
-             p.attachments = $attachments",
+             p.attachments = $attachments,
+             p.embed_uri = $embed_uri,
+             p.embed_kind = $embed_kind,
+             p.namespace = 'mapky.app'",
     )
     .param("author_id", post.author_id.clone())
     .param("post_id", post.id.clone())
-    .param("osm_canonical", post.osm_canonical.clone())
-    .param("content", post.content.clone().unwrap_or_default())
-    .param("rating", post.rating.map(|r| r as i64))
+    .param("content", post.content.clone())
     .param("kind", post.kind.clone())
     .param("parent_uri", post.parent_uri.clone())
     .param("attachments", post.attachments.clone())
+    .param("embed_uri", post.embed_uri.clone())
+    .param("embed_kind", post.embed_kind.clone())
     .param("indexed_at", post.indexed_at)
 }
 
-/// Create a REPLY_TO edge from a child post to its parent.
-/// Uses MATCH for the parent — if the parent doesn't exist yet (out-of-order
-/// delivery), the query silently does nothing.
-/// `child_id` and `parent_id` are both compound keys (`author_id:post_id`).
-pub fn link_reply(child_id: &str, parent_id: &str) -> Query {
+/// Create an `[:ABOUT]` edge from a `:MapkyAppPost` (cross-namespace comment)
+/// to a `:Place` — used when the post's parent is an OSM URL. Symmetric with
+/// the review handler's anchor.
+pub fn link_post_to_place(post_id: &str, osm_canonical: &str) -> Query {
     Query::new(
-        "mapky_link_reply",
-        "MATCH (child:MapkyAppPost {id: $child_id})
-         MATCH (parent:MapkyAppPost {id: $parent_id})
-         MERGE (child)-[:REPLY_TO]->(parent)",
+        "mapky_link_post_to_place",
+        "MATCH (p:MapkyAppPost {id: $post_id})
+         MATCH (place:Place {osm_canonical: $osm_canonical})
+         MERGE (p)-[:ABOUT]->(place)",
     )
-    .param("child_id", child_id)
-    .param("parent_id", parent_id)
+    .param("post_id", post_id)
+    .param("osm_canonical", osm_canonical)
+}
+
+/// Create a `[:REPLY_TO]` edge from a `:MapkyAppPost` child to a parent
+/// MapKy resource (any of the labels in `mapky_resource_label`).
+///
+/// Uses MATCH for the parent — if it doesn't exist yet (out-of-order delivery),
+/// the query silently does nothing. `parent_label` is plugin-controlled (not
+/// user input) so format-interpolating it into the cypher string is safe.
+pub fn link_mapky_post_reply(child_id: &str, parent_label: &str, parent_id: &str) -> Query {
+    let cypher = format!(
+        "MATCH (child:MapkyAppPost {{id: $child_id}})
+         MATCH (parent:{parent_label} {{id: $parent_id}})
+         MERGE (child)-[:REPLY_TO]->(parent)"
+    );
+    Query::new("mapky_link_mapky_post_reply", &cypher)
+        .param("child_id", child_id)
+        .param("parent_id", parent_id)
 }
 
 /// Increment the running average rating on a Place after a new review.
