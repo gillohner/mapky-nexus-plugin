@@ -375,3 +375,72 @@ pub fn create_resource_tag(
         .param("label", label)
         .param("indexed_at", indexed_at)
 }
+
+// ── BTCMap sync ─────────────────────────────────────────────────────────
+
+/// Batch-upsert Bitcoin-accepting OSM places from BTCMap.
+///
+/// `rows` is a pre-built `BoltType::List` of maps; each map carries:
+/// `osm_canonical`, `osm_type`, `osm_id`, `lat`, `lon`, `name`,
+/// `btc_onchain`, `btc_lightning`, `btc_lightning_contactless`.
+/// Construction lives in `btcmap_sync.rs` so this module stays Cypher-only.
+///
+/// Behavior:
+/// - `MERGE` on `osm_canonical` so we adopt user-driven places that
+///   already exist (created from posts/collections/tags).
+/// - `ON CREATE SET p.source = 'btcmap'` distinguishes BTCMap-origin
+///   nodes from user-driven ones; we never overwrite an existing
+///   `source`. Newly-created BTCMap nodes get sensible defaults for
+///   the social counters (review_count, avg_rating, tag_count, photo_count).
+/// - Always sets `accepts_bitcoin` + the sub-flags + `btc_synced_at`,
+///   matching the post-sync cleanup query that clears stale flags.
+pub fn upsert_btcmap_places(rows: neo4rs::BoltType, synced_at: i64) -> Query {
+    Query::new(
+        "mapky_upsert_btcmap_places",
+        "UNWIND $rows AS row
+         MERGE (p:Place {osm_canonical: row.osm_canonical})
+         ON CREATE SET
+             p.source = 'btcmap',
+             p.osm_type = row.osm_type,
+             p.osm_id = row.osm_id,
+             p.location = point({latitude: row.lat, longitude: row.lon}),
+             p.lat = row.lat,
+             p.lon = row.lon,
+             p.geocoded = true,
+             p.review_count = 0,
+             p.avg_rating = 0.0,
+             p.tag_count = 0,
+             p.photo_count = 0,
+             p.indexed_at = $synced_at,
+             p.name = row.name
+         SET p.accepts_bitcoin = true,
+             p.btc_onchain = row.btc_onchain,
+             p.btc_lightning = row.btc_lightning,
+             p.btc_lightning_contactless = row.btc_lightning_contactless,
+             p.btc_synced_at = $synced_at",
+    )
+    .param("rows", rows)
+    .param("synced_at", synced_at)
+}
+
+/// Clear BTC flags from places that fell out of the latest BTCMap sync.
+///
+/// Run after `upsert_btcmap_places` for the full set: any place still
+/// flagged `accepts_bitcoin = true` whose `btc_synced_at` is older than
+/// the current sync timestamp lost its BTCMap entry. We don't delete
+/// the node (it might be tagged/bookmarked/posted-about) — just clear
+/// the BTC properties so the BTC viewport stops returning it.
+pub fn clear_stale_btcmap_flags(synced_at: i64) -> Query {
+    Query::new(
+        "mapky_clear_stale_btcmap_flags",
+        "MATCH (p:Place)
+         WHERE p.accepts_bitcoin = true
+           AND coalesce(p.btc_synced_at, 0) < $synced_at
+         REMOVE p.accepts_bitcoin,
+                p.btc_onchain,
+                p.btc_lightning,
+                p.btc_lightning_contactless,
+                p.btc_synced_at",
+    )
+    .param("synced_at", synced_at)
+}

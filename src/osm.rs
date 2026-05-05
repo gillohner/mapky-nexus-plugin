@@ -141,7 +141,7 @@ pub(crate) fn nominatim_rate_limiter() -> &'static Mutex<Instant> {
 /// Block until the configured min-interval has elapsed since the last
 /// call. Holding the lock through the wait serialises concurrent
 /// callers — every request waits its turn, none are dropped.
-async fn wait_for_rate_limit() {
+pub(crate) async fn wait_for_rate_limit() {
     let interval = config().min_interval;
     let mut last = nominatim_rate_limiter().lock().await;
     let elapsed = last.elapsed();
@@ -149,6 +149,13 @@ async fn wait_for_rate_limit() {
         tokio::time::sleep(interval - elapsed).await;
     }
     *last = Instant::now();
+}
+
+/// Configured upstream Nominatim base URL (`MAPKY_NOMINATIM_URL` or
+/// the public default). Exposed for callers that build their own
+/// request URLs (e.g. `models/place.rs::resolve_osm_coords`).
+pub(crate) fn nominatim_url() -> &'static str {
+    &config().nominatim_url
 }
 
 /// Public-facing lookup result. Mirrors the frontend's
@@ -223,6 +230,28 @@ fn cache_key(osm_type: &str, osm_id: i64) -> String {
         _ => '?',
     };
     format!("{REDIS_KEY_PREFIX}{prefix}{osm_id}")
+}
+
+/// Seed the lookup cache with a pre-built `NominatimLookup` — used by
+/// the BTCMap sync to populate `mapky:osm:v2:lookup:` directly from
+/// the dump's tag map, so place panels for BTC POIs never have to
+/// queue behind the 1 req/s Nominatim gate. Uses the regular hit TTL.
+///
+/// Fire-and-forget: returns `true` only when the write reached Redis,
+/// but a Redis hiccup just means the next `/osm/lookup` will fetch
+/// upstream (correct behavior, no stale data persisted).
+pub async fn seed_lookup_cache(osm_type: &str, osm_id: i64, lookup: &NominatimLookup) -> bool {
+    let cfg = config();
+    let key = cache_key(osm_type, osm_id);
+    let Ok(json) = serde_json::to_string(lookup) else {
+        return false;
+    };
+    let Ok(mut conn) = get_redis_conn().await else {
+        return false;
+    };
+    conn.set_ex::<_, _, ()>(&key, json, cfg.cache_ttl_secs)
+        .await
+        .is_ok()
 }
 
 fn type_char(osm_type: &str) -> Option<char> {
@@ -716,4 +745,223 @@ pub async fn batch_lookup_cached(refs: &[(String, i64)]) -> Vec<NominatimLookup>
         .enumerate()
         .map(|(i, opt)| opt.unwrap_or_else(|| empty_lookup(&refs[i].0, refs[i].1)))
         .collect()
+}
+
+// ── /search and /reverse — cached free-form queries ─────────────────────
+
+/// Cache key prefix for `/search` results. Versioned alongside the
+/// lookup prefix so a payload-shape bump rolls both at once.
+const REDIS_SEARCH_PREFIX: &str = "mapky:osm:v2:search:";
+/// Cache key prefix for `/reverse` results. Same versioning scheme.
+const REDIS_REVERSE_PREFIX: &str = "mapky:osm:v2:reverse:";
+/// Search results live shorter than `/lookup`: a place that didn't
+/// match yesterday might match today (new tags, new index pass).
+/// 24 h is the comfort floor for pure free-text queries.
+const SEARCH_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+/// Reverse-geocode by quantized coordinates is effectively immutable
+/// (the place at lat/lon doesn't move). Same TTL as `/lookup` hits.
+const REVERSE_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Parameters for the cached `/search` proxy. Mirrors the public
+/// Nominatim subset the frontend actually uses — see
+/// `mapky-app/src/lib/api/nominatim.ts`.
+///
+/// Free-text inputs are lower-cased + trimmed when building the
+/// cache key so callers don't need to canonicalize.
+#[derive(Debug, Clone)]
+pub struct SearchParams {
+    pub q: String,
+    /// `west,north,east,south` — passes straight through to Nominatim.
+    /// `None` is a global-scope query.
+    pub viewbox: Option<String>,
+    /// `bounded=1` restricts results to the viewbox. Falsy = scoped
+    /// hint (scoring boost).
+    pub bounded: bool,
+    /// Default 8 — Nominatim caps responses at 50.
+    pub limit: u32,
+    /// Drop spatial near-duplicates with the same display name.
+    pub dedupe: bool,
+    /// Include the `address` map in responses. Set false for the
+    /// search-bar autocomplete (smaller payload).
+    pub addressdetails: bool,
+}
+
+/// Run a `/search` query against the configured Nominatim, caching
+/// the resolved list in Redis.
+///
+/// Reuses the global rate-limit gate so search calls and `/lookup`
+/// calls never collide against Nominatim's 1 req/s policy.
+pub async fn search_cached(params: &SearchParams) -> Vec<NominatimLookup> {
+    let cfg = config();
+    let key = build_search_key(params);
+
+    if let Some(cached) = read_cached_list(&key).await {
+        return cached;
+    }
+
+    wait_for_rate_limit().await;
+
+    let mut request = nominatim_client()
+        .get(format!("{}/search", cfg.nominatim_url))
+        .query(&[("q", params.q.as_str()), ("format", "json")])
+        .query(&[("limit", params.limit.to_string())])
+        .query(&[("dedupe", if params.dedupe { "1" } else { "0" })])
+        .query(&[(
+            "addressdetails",
+            if params.addressdetails { "1" } else { "0" },
+        )]);
+    if let Some(vb) = &params.viewbox {
+        request = request.query(&[("viewbox", vb.as_str())]);
+        if params.bounded {
+            request = request.query(&[("bounded", "1")]);
+        }
+    }
+
+    let raw: Vec<NominatimRaw> = match request.send().await {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(ok) => ok.json().await.unwrap_or_default(),
+            Err(e) => {
+                warn!("Nominatim /search upstream status: {e}");
+                // Don't cache upstream errors — they're transient.
+                return Vec::new();
+            }
+        },
+        Err(e) => {
+            warn!("Nominatim /search request failed: {e}");
+            return Vec::new();
+        }
+    };
+    let results: Vec<NominatimLookup> = raw.into_iter().map(NominatimRaw::into_lookup).collect();
+
+    // Cache (including empty results — short TTL keeps pathological
+    // "no match yet" loops from hammering Nominatim).
+    if let Ok(json) = serde_json::to_string(&results) {
+        let ttl = if results.is_empty() {
+            cfg.empty_cache_ttl_secs
+        } else {
+            SEARCH_CACHE_TTL_SECS
+        };
+        if let Ok(mut conn) = get_redis_conn().await {
+            let _: Result<(), _> = conn.set_ex(&key, json, ttl).await;
+        }
+    }
+
+    results
+}
+
+/// Reverse-geocode a single coordinate. Returns `None` when Nominatim
+/// has nothing for that point — the empty case is cached short so a
+/// recently-named place self-heals.
+pub async fn reverse_cached(lat: f64, lon: f64, zoom: u32) -> Option<NominatimLookup> {
+    let cfg = config();
+    // Quantize to ~1 m precision so every call within a 1 m bin shares
+    // the same cache slot — matches the frontend's localStorage key
+    // shape (`makeReverseKey`) so the two layers don't fragment.
+    let key = format!(
+        "{REDIS_REVERSE_PREFIX}{lat:.5},{lon:.5}:z{zoom}",
+        lat = lat,
+        lon = lon,
+        zoom = zoom
+    );
+
+    match read_cached_optional(&key).await {
+        Some(Some(hit)) => return Some(hit),
+        Some(None) => return None,
+        None => {}
+    }
+
+    wait_for_rate_limit().await;
+
+    let request = nominatim_client()
+        .get(format!("{}/reverse", cfg.nominatim_url))
+        .query(&[
+            ("lat", format!("{lat:.6}")),
+            ("lon", format!("{lon:.6}")),
+            ("format", "json".to_string()),
+            ("zoom", zoom.to_string()),
+        ]);
+
+    let raw: NominatimRaw = match request.send().await {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(ok) => match ok.json().await {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    warn!("Nominatim /reverse parse failed: {e}");
+                    return None;
+                }
+            },
+            Err(e) => {
+                warn!("Nominatim /reverse upstream status: {e}");
+                return None;
+            }
+        },
+        Err(e) => {
+            warn!("Nominatim /reverse request failed: {e}");
+            return None;
+        }
+    };
+    let result = raw.into_lookup();
+    let empty = is_empty(&result);
+
+    // Cache the result (or the empty marker). `null` JSON = empty.
+    let payload = if empty {
+        "null".to_string()
+    } else {
+        match serde_json::to_string(&result) {
+            Ok(s) => s,
+            Err(_) => return Some(result),
+        }
+    };
+    let ttl = if empty {
+        cfg.empty_cache_ttl_secs
+    } else {
+        REVERSE_CACHE_TTL_SECS
+    };
+    if let Ok(mut conn) = get_redis_conn().await {
+        let _: Result<(), _> = conn.set_ex(&key, payload, ttl).await;
+    }
+
+    if empty {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Build a stable cache key for a `/search` call. The key folds in
+/// every parameter that affects the upstream response so two calls
+/// with different limits/viewboxes don't collide.
+fn build_search_key(p: &SearchParams) -> String {
+    let q = p.q.trim().to_lowercase();
+    let vb = p.viewbox.as_deref().unwrap_or("");
+    format!(
+        "{REDIS_SEARCH_PREFIX}q={q}|vb={vb}|b={}|l={}|d={}|a={}",
+        if p.bounded { 1 } else { 0 },
+        p.limit,
+        if p.dedupe { 1 } else { 0 },
+        if p.addressdetails { 1 } else { 0 }
+    )
+}
+
+/// Read a cached `Vec<NominatimLookup>` if present.
+async fn read_cached_list(key: &str) -> Option<Vec<NominatimLookup>> {
+    let mut conn = get_redis_conn().await.ok()?;
+    let raw: Option<String> = conn.get(key).await.ok()?;
+    let json = raw?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Read a cached optional `NominatimLookup`. Inner `Some/None` follows
+/// the cache convention: outer `None` = miss, `Some(None)` = cached
+/// empty (don't re-fetch), `Some(Some(_))` = cached hit.
+async fn read_cached_optional(key: &str) -> Option<Option<NominatimLookup>> {
+    let mut conn = get_redis_conn().await.ok()?;
+    let raw: Option<String> = conn.get(key).await.ok()?;
+    let json = raw?;
+    if json == "null" {
+        return Some(None);
+    }
+    serde_json::from_str::<NominatimLookup>(&json)
+        .ok()
+        .map(Some)
 }

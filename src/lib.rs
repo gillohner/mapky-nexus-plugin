@@ -5,10 +5,12 @@
 //! dispatcher can route events here before `pubky-app-specs` URI parsing.
 
 mod api;
+pub mod btcmap_sync;
 pub mod handlers;
 pub mod models;
 pub mod osm;
 pub mod queries;
+pub mod routing;
 
 use axum::Router;
 use mapky_app_specs::MapkyAppObject;
@@ -259,6 +261,12 @@ impl NexusPlugin for MapkyPlugin {
                 }
             }
         }
+
+        // Kick off the BTCMap → Neo4j sync. Runs as a tokio background
+        // task; first iteration starts immediately, then every
+        // MAPKY_BTCMAP_REFRESH_SECS. Failures are logged and swallowed
+        // so a flaky upstream never blocks plugin startup.
+        btcmap_sync::spawn();
 
         Ok(())
     }
