@@ -18,10 +18,10 @@ on:
         required: false
         type: string
       pubky_nexus_ref:
-        description: "pubky-nexus ref (default: main, the upstream default branch)"
+        description: "pubky-nexus ref on gillohner/pubky-nexus (default branch with the mapky feature wired into nexusd)"
         required: false
         type: string
-        default: main
+        default: feat/mapky-plugin-system
       app_specs_ref:
         description: "mapky-app-specs ref (default: master)"
         required: false
@@ -58,10 +58,15 @@ jobs:
       - name: Checkout pubky-nexus
         uses: actions/checkout@v4
         with:
-          repository: pubky/pubky-nexus
-          # Default branch on pubky/pubky-nexus is `main`; older defaults of
-          # `master` would 404 the fetch.
-          ref: ${{ inputs.pubky_nexus_ref || 'main' }}
+          # Use the user's fork — that's where the `mapky` feature is wired
+          # into `nexusd/Cargo.toml` (`mapky-nexus-plugin` path-dep + matching
+          # feature flag). Upstream `pubky/pubky-nexus` doesn't have the
+          # plugin-system integration on `main` yet, so building against it
+          # fails with `none of the selected packages contains this feature:
+          # mapky`. Track our integration branch on the fork until upstream
+          # ships the plugin system.
+          repository: gillohner/pubky-nexus
+          ref: ${{ inputs.pubky_nexus_ref || 'feat/mapky-plugin-system' }}
           path: pubky-nexus
 
       - name: Checkout mapky-app-specs
