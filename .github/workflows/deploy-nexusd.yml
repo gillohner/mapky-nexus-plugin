@@ -88,7 +88,12 @@ jobs:
       - name: Build nexusd (release, with mapky feature)
         working-directory: pubky-nexus
         run: |
-          cargo build --release --features mapky --bin nexusd
+          # `-p nexusd` scopes the `--features mapky` flag to the package
+          # that defines it. Without `-p`, cargo checks the feature against
+          # every workspace member and errors with "none of the selected
+          # packages contains this feature: mapky" — even though `--bin
+          # nexusd` is set, that filters build targets, not feature scope.
+          cargo build --release -p nexusd --features mapky --bin nexusd
           ls -la target/release/nexusd
           file target/release/nexusd
 
