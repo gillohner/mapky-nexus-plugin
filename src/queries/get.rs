@@ -47,9 +47,19 @@ impl PlaceActivity {
 
 /// Filters layered on top of the bbox.
 ///
-/// `activities` — multi-select OR. Empty (default) means "no activity
-/// narrowing". Any populated entry narrows to places matching at
-/// least one of the listed activities.
+/// `activities` — multi-select OR. Empty defaults to "any Mapky
+/// engagement" (OR of all four activities). Selecting one or more
+/// pills narrows further. This default exists because the BTCMap
+/// sync floods Neo4j with `:Place` nodes that have no Mapky data
+/// (no reviews/tags/posts/collections); without this default, every
+/// /viewport call would return every BTC merchant in the bbox and
+/// the place layer would be unfilterable. BTC merchants surface via
+/// the dedicated `/btc/viewport` overlay instead.
+///
+/// `include_unengaged` — escape hatch that bypasses the
+/// "any-Mapky-engagement" default and returns every Place node in
+/// the bbox (the old behavior). Useful for admin / "show me the raw
+/// graph" UIs; off by default.
 ///
 /// `min_rating` — optional 0–10 floor (avg_rating is stored on the
 /// 0–10 scale so half-stars stay precise; the API layer multiplies a
@@ -57,25 +67,53 @@ impl PlaceActivity {
 #[derive(Debug, Clone, Default)]
 pub struct PlaceFilters {
     pub activities: Vec<PlaceActivity>,
+    pub include_unengaged: bool,
     pub min_rating: Option<f64>,
 }
 
 impl PlaceFilters {
     /// Build the Cypher fragment that AND's onto the base bbox WHERE.
-    /// Empty when no filters are active so the simple case stays clean.
+    /// Empty when `include_unengaged` is on AND no other filter is set
+    /// — preserves the unfiltered raw-graph fast path.
     fn cypher_clause(&self) -> String {
         let mut out = String::new();
-        if !self.activities.is_empty() {
-            // De-dup while preserving order — repeated `?activity=tagged`
-            // shouldn't OR the same predicate twice.
-            let mut seen = std::collections::HashSet::new();
-            let or_chain = self
-                .activities
+        // De-dup activities while preserving order — repeated tokens
+        // shouldn't OR the same predicate twice.
+        let mut seen = std::collections::HashSet::new();
+        let active: Vec<&PlaceActivity> = self
+            .activities
+            .iter()
+            .filter(|a| seen.insert(**a))
+            .collect();
+
+        let activity_clause: Option<String> = if !active.is_empty() {
+            // Explicit activities: narrow to those.
+            Some(
+                active
+                    .iter()
+                    .map(|a| a.cypher_predicate())
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+            )
+        } else if !self.include_unengaged {
+            // Empty + no opt-out: default to "any Mapky engagement".
+            Some(
+                [
+                    PlaceActivity::Tagged,
+                    PlaceActivity::Reviewed,
+                    PlaceActivity::Posted,
+                    PlaceActivity::Collected,
+                ]
                 .iter()
-                .filter(|a| seen.insert(**a))
                 .map(|a| a.cypher_predicate())
                 .collect::<Vec<_>>()
-                .join(" OR ");
+                .join(" OR "),
+            )
+        } else {
+            // include_unengaged + no explicit activities: no narrowing.
+            None
+        };
+        if let Some(or_chain) = activity_clause {
             out.push_str(" AND (");
             out.push_str(&or_chain);
             out.push(')');
@@ -1241,8 +1279,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_filter_emits_no_clause() {
+    fn default_filter_narrows_to_any_mapky_engagement() {
         let f = PlaceFilters::default();
+        assert_eq!(
+            f.cypher_clause(),
+            " AND (p.tag_count > 0 OR p.review_count > 0 OR EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) } OR EXISTS { (:MapkyAppCollection)-[:CONTAINS]->(p) })"
+        );
+    }
+
+    #[test]
+    fn include_unengaged_emits_no_clause() {
+        let f = PlaceFilters {
+            include_unengaged: true,
+            ..Default::default()
+        };
         assert_eq!(f.cypher_clause(), "");
     }
 
@@ -1250,6 +1300,7 @@ mod tests {
     fn single_activity_wraps_in_parens() {
         let f = PlaceFilters {
             activities: vec![PlaceActivity::Tagged],
+            include_unengaged: false,
             min_rating: None,
         };
         assert_eq!(f.cypher_clause(), " AND (p.tag_count > 0)");
@@ -1259,6 +1310,7 @@ mod tests {
     fn multiple_activities_or_chain() {
         let f = PlaceFilters {
             activities: vec![PlaceActivity::Tagged, PlaceActivity::Reviewed, PlaceActivity::Posted],
+            include_unengaged: false,
             min_rating: None,
         };
         assert_eq!(
@@ -1271,6 +1323,7 @@ mod tests {
     fn duplicate_activities_dedup() {
         let f = PlaceFilters {
             activities: vec![PlaceActivity::Tagged, PlaceActivity::Tagged, PlaceActivity::Reviewed],
+            include_unengaged: false,
             min_rating: None,
         };
         assert_eq!(
@@ -1280,9 +1333,23 @@ mod tests {
     }
 
     #[test]
-    fn min_rating_renders_decimal() {
+    fn min_rating_alone_pairs_with_engagement_default() {
+        // No activities + no include_unengaged → engagement OR is added.
+        // min_rating is added on top so this combines correctly.
         let f = PlaceFilters {
             activities: vec![],
+            include_unengaged: false,
+            min_rating: Some(7.5),
+        };
+        assert!(f.cypher_clause().starts_with(" AND ("));
+        assert!(f.cypher_clause().ends_with(" AND p.avg_rating >= 7.5"));
+    }
+
+    #[test]
+    fn min_rating_with_include_unengaged_emits_only_rating() {
+        let f = PlaceFilters {
+            activities: vec![],
+            include_unengaged: true,
             min_rating: Some(7.5),
         };
         assert_eq!(f.cypher_clause(), " AND p.avg_rating >= 7.5");
@@ -1292,6 +1359,7 @@ mod tests {
     fn activity_and_min_rating_combine() {
         let f = PlaceFilters {
             activities: vec![PlaceActivity::Reviewed],
+            include_unengaged: false,
             min_rating: Some(8.0),
         };
         assert_eq!(

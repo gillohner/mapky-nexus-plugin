@@ -207,6 +207,13 @@ pub struct PlaceViewportQuery {
     /// to the internal 0–10 storage scale before hitting Cypher.
     #[serde(default)]
     pub min_rating: Option<f64>,
+    /// When true AND no explicit activities are selected, return every
+    /// Place node in the bbox (including BTCMap-synced merchants with
+    /// no Mapky engagement). Off by default — the place layer hides
+    /// unengaged BTC merchants so they only surface via the dedicated
+    /// `/btc/viewport` overlay.
+    #[serde(default)]
+    pub include_unengaged: bool,
 }
 
 fn default_viewport_zoom() -> u8 {
@@ -243,6 +250,11 @@ pub struct MultiViewportQuery {
     /// selects `places`.
     #[serde(default)]
     pub min_rating: Option<f64>,
+    /// Opt-out for the place layer's "any-Mapky-engagement" default,
+    /// only consulted when `include` selects `places`. See
+    /// `PlaceViewportQuery::include_unengaged`.
+    #[serde(default)]
+    pub include_unengaged: bool,
 }
 
 /// Composite-viewport response. Each field is `Some` only when the
@@ -329,12 +341,18 @@ fn parse_include(raw: Option<&str>) -> IncludeSet {
 }
 
 /// Parse the place-viewport filter query params into a `PlaceFilters`.
-/// `activity` is comma-separated; unknown tokens are ignored.
-/// `min_rating` is on the user-facing 0–5 scale and gets doubled to
-/// match the 0–10 storage scale before reaching Cypher.
+///
+/// - `activity` is comma-separated; unknown tokens are ignored.
+/// - `min_rating` is on the user-facing 0–5 scale and gets doubled to
+///   match the 0–10 storage scale before reaching Cypher.
+/// - `include_unengaged` opts out of the "any-Mapky-engagement"
+///   default — when on AND no explicit activities are given, the
+///   query returns every Place node in the bbox (BTCMap-flooded
+///   merchants included).
 fn parse_place_filters(
     activity: Option<&str>,
     min_rating: Option<f64>,
+    include_unengaged: bool,
 ) -> queries::get::PlaceFilters {
     let activities = activity
         .map(|raw| {
@@ -352,6 +370,7 @@ fn parse_place_filters(
         .map(|r| (r * 2.0).clamp(0.0, 10.0));
     queries::get::PlaceFilters {
         activities,
+        include_unengaged,
         min_rating,
     }
 }
@@ -914,6 +933,7 @@ async fn fetch_routes_near_point(
         ("limit" = Option<i64>, Query, description = "Max rows (clusters or places); default 100"),
         ("activity" = Option<String>, Query, description = "Comma-separated activity OR set: tagged,reviewed,posted,collected"),
         ("min_rating" = Option<f64>, Query, description = "Minimum average rating (0.0–5.0)"),
+        ("include_unengaged" = Option<bool>, Query, description = "Opt out of the 'any-Mapky-engagement' default (off by default)"),
     ),
     responses(
         (status = 200, description = "Cluster summary or individual places", body = ViewportResponse),
@@ -924,7 +944,11 @@ async fn viewport(
     State(_ctx): State<PluginContext>,
     Query(params): Query<PlaceViewportQuery>,
 ) -> ApiResult<ViewportResponse> {
-    let filters = parse_place_filters(params.activity.as_deref(), params.min_rating);
+    let filters = parse_place_filters(
+        params.activity.as_deref(),
+        params.min_rating,
+        params.include_unengaged,
+    );
     let resp = fetch_places_in_viewport(
         params.min_lat,
         params.min_lon,
@@ -963,6 +987,7 @@ async fn viewport(
         ("include" = Option<String>, Query, description = "Comma-separated layer names: places,collections,captures,routes. Default: places."),
         ("activity" = Option<String>, Query, description = "Place filter: comma-separated activity OR set (tagged,reviewed,posted,collected)"),
         ("min_rating" = Option<f64>, Query, description = "Place filter: minimum average rating (0.0–5.0)"),
+        ("include_unengaged" = Option<bool>, Query, description = "Place filter: opt out of the 'any-Mapky-engagement' default"),
     ),
     responses(
         (status = 200, description = "Composite envelope with one branch per requested layer", body = MultiViewportResponse),
@@ -974,7 +999,11 @@ async fn viewport_multi(
     Query(params): Query<MultiViewportQuery>,
 ) -> ApiResult<MultiViewportResponse> {
     let inc = parse_include(params.include.as_deref());
-    let filters = parse_place_filters(params.activity.as_deref(), params.min_rating);
+    let filters = parse_place_filters(
+        params.activity.as_deref(),
+        params.min_rating,
+        params.include_unengaged,
+    );
 
     // Build a future per layer. When the layer is not requested, the
     // future short-circuits to `Ok(None)` — skipped by `try_join!` at
