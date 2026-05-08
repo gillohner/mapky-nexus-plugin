@@ -13,6 +13,7 @@ use nexus_common::plugin::PluginContext;
 use serde::{Deserialize, Serialize};
 use utoipa::OpenApi;
 
+use crate::btcmap_sync::{self, SyncStatus};
 use crate::handlers::mapky_post::mapky_resource_label;
 use crate::models::collection::CollectionDetails;
 use crate::models::geo_capture::GeoCaptureDetails;
@@ -23,8 +24,9 @@ use crate::models::review::ReviewDetails;
 use crate::models::route::RouteDetails;
 use crate::models::sequence::SequenceDetails;
 use crate::models::tag::PostTagDetails;
-use crate::btcmap_sync::{self, SyncStatus};
-use crate::osm::{batch_lookup_cached, reverse_cached, search_cached, NominatimLookup, SearchParams};
+use crate::osm::{
+    batch_lookup_cached, reverse_cached, search_cached, NominatimLookup, SearchParams,
+};
 use crate::queries;
 use crate::routing::{self as routing_proxy, RouteOutcome};
 
@@ -32,7 +34,14 @@ pub fn routes(ctx: PluginContext) -> Router {
     Router::new()
         // ── Place ──
         .route("/viewport", get(viewport))
+        // Composite map-viewport: one request, up to four parallel Neo4j
+        // queries (places + collections + captures + routes), narrowed by
+        // `include`. See `viewport_multi`.
+        .route("/viewport/all", get(viewport_multi))
         .route("/place/{osm_type}/{osm_id}", get(place_detail))
+        // Composite place-detail: detail + reviews + posts + tags +
+        // collections + routes in one request. See `place_detail_full`.
+        .route("/place/{osm_type}/{osm_id}/full", get(place_detail_full))
         .route("/place/{osm_type}/{osm_id}/reviews", get(place_reviews))
         .route("/place/{osm_type}/{osm_id}/posts", get(place_posts))
         .route("/place/{osm_type}/{osm_id}/tags", get(place_tags))
@@ -65,10 +74,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/geo_captures/user/{user_id}", get(user_geo_captures))
         .route("/geo_captures/nearby", get(nearby_geo_captures))
         // ── Sequence ──
-        .route(
-            "/sequences/{author_id}/{sequence_id}",
-            get(sequence_detail),
-        )
+        .route("/sequences/{author_id}/{sequence_id}", get(sequence_detail))
         .route(
             "/sequences/{author_id}/{sequence_id}/tags",
             get(sequence_tags),
@@ -128,7 +134,9 @@ pub fn routes(ctx: PluginContext) -> Router {
         (name = "Routing", description = "Cached proxy for Valhalla routing"),
     ),
     paths(
-        viewport, place_detail, place_reviews, place_posts, place_tags, place_routes,
+        viewport, viewport_multi,
+        place_detail, place_detail_full,
+        place_reviews, place_posts, place_tags, place_routes,
         review_tags, user_reviews,
         post_tags, user_posts, resource_replies,
         incidents_viewport, incident_detail, user_incidents,
@@ -147,7 +155,9 @@ pub fn routes(ctx: PluginContext) -> Router {
     components(schemas(
         PlaceDetails, ReviewDetails, MapkyPostDetails, PostTagDetails,
         IncidentDetails, GeoCaptureDetails, SequenceDetails, CollectionDetails, RouteDetails,
-        ViewportQuery, PlaceViewportQuery, PostsQuery, PaginationQuery, NearbyQuery,
+        ViewportQuery, PlaceViewportQuery, MultiViewportQuery, MultiViewportResponse,
+        PlaceFullQuery, PlaceFullResponse,
+        PostsQuery, PaginationQuery, NearbyQuery,
         TagSearchQuery, TagSearchResponse,
         OsmLookupQuery, OsmSearchQuery, OsmReverseQuery, NominatimLookup,
         BitcoinPoi, SyncStatus,
@@ -197,6 +207,120 @@ pub struct PlaceViewportQuery {
 
 fn default_viewport_zoom() -> u8 {
     13
+}
+
+/// Composite-viewport query — superset of `PlaceViewportQuery` with an
+/// `include` selector. The handler runs one Neo4j query per requested
+/// layer in parallel and returns a single envelope, eliminating the four
+/// independent fetches the frontend used to fan out per pan.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct MultiViewportQuery {
+    pub min_lat: f64,
+    pub min_lon: f64,
+    pub max_lat: f64,
+    pub max_lon: f64,
+    /// Zoom for the place layer's cluster/individual decision. Ignored
+    /// by the other layers.
+    #[serde(default = "default_viewport_zoom")]
+    pub zoom: u8,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    /// Comma-separated layer names. Recognized: `places`, `collections`,
+    /// `captures`, `routes`. Unknown tokens are silently ignored. When
+    /// omitted, defaults to `places` so the endpoint is useful as a
+    /// drop-in replacement for `/viewport`.
+    #[serde(default)]
+    pub include: Option<String>,
+    /// Place filter pills — only consulted when `include` selects `places`.
+    #[serde(default)]
+    pub bitcoin: bool,
+    #[serde(default)]
+    pub reviewed: bool,
+    #[serde(default)]
+    pub tagged: bool,
+}
+
+/// Composite-viewport response. Each field is `Some` only when the
+/// matching layer was selected via `include`; absent fields are omitted
+/// from the JSON entirely (`skip_serializing_if`) so a `?include=places`
+/// caller gets the same wire bytes whether the other layers exist or not.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct MultiViewportResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub places: Option<ViewportResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collections: Option<Vec<CollectionDetails>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captures: Option<Vec<GeoCaptureDetails>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<RouteDetails>>,
+}
+
+/// Composite envelope returned by `/v0/mapky/place/{type}/{id}/full`.
+/// All six slices are computed in one request via parallel Neo4j
+/// queries; the frontend's PlacePanel reads the whole struct in one
+/// shot instead of mounting six independent `useQuery` hooks.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PlaceFullResponse {
+    pub detail: PlaceDetails,
+    pub reviews: Vec<ReviewDetails>,
+    pub posts: Vec<MapkyPostDetails>,
+    pub tags: Vec<PostTagDetails>,
+    pub collections: Vec<CollectionDetails>,
+    pub routes: Vec<RouteDetails>,
+}
+
+/// Pagination knobs for the composite place-detail endpoint. Each
+/// limit applies to the matching slice; defaults match the
+/// single-purpose endpoints (reviews/posts: 100; routes: 50).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct PlaceFullQuery {
+    #[serde(default = "default_limit")]
+    pub reviews_limit: i64,
+    #[serde(default = "default_limit")]
+    pub posts_limit: i64,
+    #[serde(default = "default_routes_near_limit")]
+    pub routes_limit: i64,
+}
+
+fn default_routes_near_limit() -> i64 {
+    50
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct IncludeSet {
+    places: bool,
+    collections: bool,
+    captures: bool,
+    routes: bool,
+}
+
+fn parse_include(raw: Option<&str>) -> IncludeSet {
+    let Some(raw) = raw else {
+        // Default: place layer only — same surface as `/viewport`.
+        return IncludeSet {
+            places: true,
+            ..Default::default()
+        };
+    };
+    let mut set = IncludeSet::default();
+    for tok in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match tok {
+            "places" => set.places = true,
+            "collections" => set.collections = true,
+            "captures" => set.captures = true,
+            "routes" => set.routes = true,
+            _ => {} // unknown — ignore, forward-compat
+        }
+    }
+    // Defensive: an `include=` with only unknown tokens would yield an
+    // all-false set and an empty response. Treat that as "default" so
+    // misuse degrades to the legacy place-only behavior rather than
+    // silently returning {}.
+    if !(set.places || set.collections || set.captures || set.routes) {
+        set.places = true;
+    }
+    set
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -457,6 +581,281 @@ async fn fetch_tags(
     Ok((found, tags))
 }
 
+// ── Viewport sub-query helpers ──────────────────────────────────────────────
+//
+// Each helper returns the success payload (or an `ApiError` tuple) for one of
+// the four map-viewport layers. They are called both by the single-purpose
+// handlers (`viewport`, `collections_viewport`, `geo_captures_viewport`,
+// `routes_viewport`) and by the composite `viewport_multi` handler, which
+// runs them in parallel via `tokio::try_join!`.
+
+async fn fetch_places_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    zoom: u8,
+    limit: i64,
+    filters: queries::get::PlaceFilters,
+) -> Result<ViewportResponse, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+
+    if zoom >= CLUSTER_ZOOM_THRESHOLD {
+        let mut stream = graph
+            .execute(queries::get::get_places_in_viewport(
+                min_lat, min_lon, max_lat, max_lon, filters, limit,
+            ))
+            .await
+            .map_err(graph_err)?;
+        let mut places = Vec::new();
+        while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+            places.push(place_details_from_row(&row));
+        }
+        return Ok(ViewportResponse::Places { places });
+    }
+
+    let cell = cluster_cell_for_zoom(zoom);
+    let mut stream = graph
+        .execute(queries::get::get_place_clusters_in_viewport(
+            min_lat, min_lon, max_lat, max_lon, cell, filters, limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    let mut clusters = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        clusters.push(PlaceCluster {
+            lat: row.get("lat").unwrap_or(0.0),
+            lon: row.get("lon").unwrap_or(0.0),
+            total: row.get("total").unwrap_or(0),
+            btc: row.get("btc").unwrap_or(0),
+            reviewed: row.get("reviewed").unwrap_or(0),
+            tagged: row.get("tagged").unwrap_or(0),
+        });
+    }
+    Ok(ViewportResponse::Clusters { clusters, cell })
+}
+
+async fn fetch_collections_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    limit: i64,
+) -> Result<Vec<CollectionDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_collections_in_viewport(
+            min_lat, min_lon, max_lat, max_lon, limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    let mut collections = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        collections.push(CollectionDetails {
+            id: row.get("id").unwrap_or_default(),
+            author_id: row.get("author_id").unwrap_or_default(),
+            name: row.get("name").unwrap_or_default(),
+            description: row.get("description").ok(),
+            items: row.get::<Vec<String>>("items").unwrap_or_default(),
+            image_uri: row.get("image_uri").ok(),
+            color: row.get("color").ok(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+    Ok(collections)
+}
+
+async fn fetch_geo_captures_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    limit: i64,
+) -> Result<Vec<GeoCaptureDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_geo_captures_in_viewport(
+            min_lat, min_lon, max_lat, max_lon, limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    let mut captures = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        captures.push(geo_capture_from_row(&row));
+    }
+    Ok(captures)
+}
+
+async fn fetch_routes_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    limit: i64,
+) -> Result<Vec<RouteDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_routes_in_viewport(
+            min_lat, min_lon, max_lat, max_lon, limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    let mut routes = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        routes.push(route_from_row(&row));
+    }
+    Ok(routes)
+}
+
+// ── Place sub-query helpers ─────────────────────────────────────────────────
+//
+// Used by the per-slice handlers (`place_detail`, `place_reviews`,
+// `place_posts`, `place_tags`, `collections_for_place`, `place_routes`) and
+// by the composite `place_detail_full` handler, which runs them in parallel
+// after resolving the place's lat/lon.
+
+async fn fetch_place_detail_by_canonical(
+    osm_canonical: &str,
+) -> Result<Option<PlaceDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_place_by_canonical(osm_canonical))
+        .await
+        .map_err(graph_err)?;
+    Ok(stream
+        .try_next()
+        .await
+        .map_err(graph_err)?
+        .map(|row| place_details_from_row(&row)))
+}
+
+async fn fetch_reviews_for_place(
+    osm_canonical: &str,
+    skip: i64,
+    limit: i64,
+) -> Result<Vec<ReviewDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_reviews_for_place(
+            osm_canonical,
+            skip,
+            limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    let mut reviews = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        reviews.push(review_from_row(&row));
+    }
+    Ok(reviews)
+}
+
+async fn fetch_mapky_posts_for_place(
+    osm_canonical: &str,
+    skip: i64,
+    limit: i64,
+) -> Result<Vec<MapkyPostDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_mapky_posts_for_place(
+            osm_canonical,
+            skip,
+            limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    let mut posts = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        posts.push(mapky_post_from_row(&row));
+    }
+    Ok(posts)
+}
+
+/// Fetch tags for a place. Returns `(found, tags)` so callers can
+/// distinguish "place doesn't exist" (`found=false`) from "place exists
+/// but has no tags" (`found=true, tags=[]`). The single-purpose handler
+/// turns `found=false` into a 404; the composite handler ignores it
+/// because we've already validated the place via `fetch_place_detail`.
+async fn fetch_tags_for_place(
+    osm_canonical: &str,
+) -> Result<(bool, Vec<PostTagDetails>), (StatusCode, Json<ApiError>)> {
+    use std::collections::HashMap;
+
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_tags_for_place(osm_canonical))
+        .await
+        .map_err(graph_err)?;
+
+    let mut found = false;
+    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        found = true;
+        let label: Option<String> = row.get("label").ok();
+        let tagger_id: Option<String> = row.get("tagger_id").ok();
+        if let (Some(l), Some(t)) = (label, tagger_id) {
+            tag_map.entry(l).or_default().push(t);
+        }
+    }
+
+    let tags: Vec<PostTagDetails> = tag_map
+        .into_iter()
+        .map(|(label, taggers)| {
+            let taggers_count = taggers.len();
+            PostTagDetails {
+                label,
+                taggers,
+                taggers_count,
+            }
+        })
+        .collect();
+
+    Ok((found, tags))
+}
+
+async fn fetch_collections_for_place(
+    osm_canonical: &str,
+) -> Result<Vec<CollectionDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_collections_containing_place(
+            osm_canonical,
+        ))
+        .await
+        .map_err(graph_err)?;
+    let mut collections = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        collections.push(CollectionDetails {
+            id: row.get("id").unwrap_or_default(),
+            author_id: row.get("author_id").unwrap_or_default(),
+            name: row.get("name").unwrap_or_default(),
+            description: row.get("description").ok(),
+            items: row.get::<Vec<String>>("items").unwrap_or_default(),
+            image_uri: row.get("image_uri").ok(),
+            color: row.get("color").ok(),
+            indexed_at: row.get("indexed_at").unwrap_or(0),
+        });
+    }
+    Ok(collections)
+}
+
+async fn fetch_routes_near_point(
+    lat: f64,
+    lon: f64,
+    limit: i64,
+) -> Result<Vec<RouteDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_routes_near_point(lat, lon, limit))
+        .await
+        .map_err(graph_err)?;
+    let mut routes = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        routes.push(route_from_row(&row));
+    }
+    Ok(routes)
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 /// Places within a geographic bounding box.
@@ -493,64 +892,142 @@ async fn viewport(
     State(_ctx): State<PluginContext>,
     Query(params): Query<PlaceViewportQuery>,
 ) -> ApiResult<ViewportResponse> {
-    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let filters = queries::get::PlaceFilters {
+        bitcoin: params.bitcoin,
+        reviewed: params.reviewed,
+        tagged: params.tagged,
+    };
+    let resp = fetch_places_in_viewport(
+        params.min_lat,
+        params.min_lon,
+        params.max_lat,
+        params.max_lon,
+        params.zoom,
+        params.limit,
+        filters,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
+/// Composite map-viewport: one request returns up to four layers.
+///
+/// `include` selects which layers to compute (`places,collections,captures,routes`).
+/// Sub-queries run in parallel via `tokio::try_join!` so latency stays at
+/// max(t_layers) rather than sum(t_layers). Layers not selected are omitted
+/// from the response (`skip_serializing_if = "Option::is_none"`).
+///
+/// Replaces the four-fetch fan-out the frontend used to do per pan
+/// (`useViewportPlaces` + `useViewportCollections` + `useViewportCaptures`
+/// + `useViewportRoutes`). The single-purpose endpoints stay mounted for
+/// backwards compat during rollout.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/viewport/all",
+    tag = "Place",
+    params(
+        ("min_lat" = f64, Query, description = "Minimum latitude"),
+        ("min_lon" = f64, Query, description = "Minimum longitude"),
+        ("max_lat" = f64, Query, description = "Maximum latitude"),
+        ("max_lon" = f64, Query, description = "Maximum longitude"),
+        ("zoom" = Option<u8>, Query, description = "Zoom for the place layer's cluster decision (defaults to 13)"),
+        ("limit" = Option<i64>, Query, description = "Max rows per layer; default 100"),
+        ("include" = Option<String>, Query, description = "Comma-separated layer names: places,collections,captures,routes. Default: places."),
+        ("bitcoin" = Option<bool>, Query, description = "Place filter: BTC-accepting only"),
+        ("reviewed" = Option<bool>, Query, description = "Place filter: at least one review"),
+        ("tagged" = Option<bool>, Query, description = "Place filter: at least one tag"),
+    ),
+    responses(
+        (status = 200, description = "Composite envelope with one branch per requested layer", body = MultiViewportResponse),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn viewport_multi(
+    State(_ctx): State<PluginContext>,
+    Query(params): Query<MultiViewportQuery>,
+) -> ApiResult<MultiViewportResponse> {
+    let inc = parse_include(params.include.as_deref());
     let filters = queries::get::PlaceFilters {
         bitcoin: params.bitcoin,
         reviewed: params.reviewed,
         tagged: params.tagged,
     };
 
-    if params.zoom >= CLUSTER_ZOOM_THRESHOLD {
-        // High-zoom path — return individual balloons. Same shape the
-        // frontend's PlaceAnnotationsLayer has always rendered, plus
-        // the new `accepts_bitcoin` / btc_* / name fields baked in by
-        // place_details_from_row.
-        let mut stream = graph
-            .execute(queries::get::get_places_in_viewport(
+    // Build a future per layer. When the layer is not requested, the
+    // future short-circuits to `Ok(None)` — skipped by `try_join!` at
+    // ~zero cost, no Neo4j round-trip.
+    let places_fut = async {
+        if inc.places {
+            fetch_places_in_viewport(
                 params.min_lat,
                 params.min_lon,
                 params.max_lat,
                 params.max_lon,
-                filters,
+                params.zoom,
                 params.limit,
-            ))
+                filters,
+            )
             .await
-            .map_err(graph_err)?;
-
-        let mut places = Vec::new();
-        while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-            places.push(place_details_from_row(&row));
+            .map(Some)
+        } else {
+            Ok(None)
         }
-        return Ok(Json(ViewportResponse::Places { places }));
-    }
+    };
+    let collections_fut = async {
+        if inc.collections {
+            fetch_collections_in_viewport(
+                params.min_lat,
+                params.min_lon,
+                params.max_lat,
+                params.max_lon,
+                params.limit,
+            )
+            .await
+            .map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    let captures_fut = async {
+        if inc.captures {
+            fetch_geo_captures_in_viewport(
+                params.min_lat,
+                params.min_lon,
+                params.max_lat,
+                params.max_lon,
+                params.limit,
+            )
+            .await
+            .map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    let routes_fut = async {
+        if inc.routes {
+            fetch_routes_in_viewport(
+                params.min_lat,
+                params.min_lon,
+                params.max_lat,
+                params.max_lon,
+                params.limit,
+            )
+            .await
+            .map(Some)
+        } else {
+            Ok(None)
+        }
+    };
 
-    // Low-zoom path — bin places into a cell-sized grid and aggregate.
-    let cell = cluster_cell_for_zoom(params.zoom);
-    let mut stream = graph
-        .execute(queries::get::get_place_clusters_in_viewport(
-            params.min_lat,
-            params.min_lon,
-            params.max_lat,
-            params.max_lon,
-            cell,
-            filters,
-            params.limit,
-        ))
-        .await
-        .map_err(graph_err)?;
+    let (places, collections, captures, routes) =
+        tokio::try_join!(places_fut, collections_fut, captures_fut, routes_fut)?;
 
-    let mut clusters = Vec::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        clusters.push(PlaceCluster {
-            lat: row.get("lat").unwrap_or(0.0),
-            lon: row.get("lon").unwrap_or(0.0),
-            total: row.get("total").unwrap_or(0),
-            btc: row.get("btc").unwrap_or(0),
-            reviewed: row.get("reviewed").unwrap_or(0),
-            tagged: row.get("tagged").unwrap_or(0),
-        });
-    }
-    Ok(Json(ViewportResponse::Clusters { clusters, cell }))
+    Ok(Json(MultiViewportResponse {
+        places,
+        collections,
+        captures,
+        routes,
+    }))
 }
 
 /// Get a single place by OSM type and ID
@@ -573,15 +1050,8 @@ async fn place_detail(
     Path((osm_type, osm_id)): Path<(String, i64)>,
 ) -> ApiResult<PlaceDetails> {
     let osm_canonical = format!("{osm_type}/{osm_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-
-    let mut stream = graph
-        .execute(queries::get::get_place_by_canonical(&osm_canonical))
-        .await
-        .map_err(graph_err)?;
-
-    match stream.try_next().await.map_err(graph_err)? {
-        Some(row) => Ok(Json(place_details_from_row(&row))),
+    match fetch_place_detail_by_canonical(&osm_canonical).await? {
+        Some(detail) => Ok(Json(detail)),
         None => Err((
             StatusCode::NOT_FOUND,
             Json(ApiError {
@@ -589,6 +1059,75 @@ async fn place_detail(
             }),
         )),
     }
+}
+
+/// Composite place-detail: detail + reviews + posts + tags + collections + routes
+/// in one request.
+///
+/// Replaces the six-fetch fan-out PlacePanel used to do on every place open.
+/// Detail is fetched first (we need lat/lon for the routes-near-point query
+/// and a 404 short-circuits the rest); the remaining five sub-queries then
+/// run in parallel via `tokio::try_join!`. Wall-clock cost is
+/// `t_detail + max(t_others)` instead of `sum(t_all)`.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/place/{osm_type}/{osm_id}/full",
+    tag = "Place",
+    params(
+        ("osm_type" = String, Path, description = "OSM element type: node, way, or relation"),
+        ("osm_id" = i64, Path, description = "OSM element ID"),
+        ("reviews_limit" = Option<i64>, Query, description = "Max reviews (default 100)"),
+        ("posts_limit" = Option<i64>, Query, description = "Max posts (default 100)"),
+        ("routes_limit" = Option<i64>, Query, description = "Max routes near the place (default 50)"),
+    ),
+    responses(
+        (status = 200, description = "Place with all related slices", body = PlaceFullResponse),
+        (status = 404, description = "Place not found", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn place_detail_full(
+    State(_ctx): State<PluginContext>,
+    Path((osm_type, osm_id)): Path<(String, i64)>,
+    Query(params): Query<PlaceFullQuery>,
+) -> ApiResult<PlaceFullResponse> {
+    let osm_canonical = format!("{osm_type}/{osm_id}");
+
+    let detail = fetch_place_detail_by_canonical(&osm_canonical)
+        .await?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: format!("Place {osm_canonical} not found"),
+                }),
+            )
+        })?;
+
+    // Fan out the five remaining slices in parallel. We discard the
+    // `found` flag from `fetch_tags_for_place` because we already
+    // proved the place exists by reading `detail`; tags-empty is just
+    // an empty Vec, not a 404.
+    let (reviews, posts, tags, collections, routes) = tokio::try_join!(
+        fetch_reviews_for_place(&osm_canonical, 0, params.reviews_limit),
+        fetch_mapky_posts_for_place(&osm_canonical, 0, params.posts_limit),
+        async {
+            fetch_tags_for_place(&osm_canonical)
+                .await
+                .map(|(_, tags)| tags)
+        },
+        fetch_collections_for_place(&osm_canonical),
+        fetch_routes_near_point(detail.lat, detail.lon, params.routes_limit),
+    )?;
+
+    Ok(Json(PlaceFullResponse {
+        detail,
+        reviews,
+        posts,
+        tags,
+        collections,
+        routes,
+    }))
 }
 
 /// Read a `:MapkyAppPost` (cross-namespace comment) row produced by any of the
@@ -870,20 +1409,7 @@ async fn place_reviews(
     Query(params): Query<PostsQuery>,
 ) -> ApiResult<Vec<ReviewDetails>> {
     let osm_canonical = format!("{osm_type}/{osm_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_reviews_for_place(
-            &osm_canonical,
-            params.skip,
-            params.limit,
-        ))
-        .await
-        .map_err(graph_err)?;
-
-    let mut reviews = Vec::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        reviews.push(review_from_row(&row));
-    }
+    let reviews = fetch_reviews_for_place(&osm_canonical, params.skip, params.limit).await?;
     Ok(Json(reviews))
 }
 
@@ -910,21 +1436,7 @@ async fn place_posts(
     Query(params): Query<PostsQuery>,
 ) -> ApiResult<Vec<MapkyPostDetails>> {
     let osm_canonical = format!("{osm_type}/{osm_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_mapky_posts_for_place(
-            &osm_canonical,
-            params.skip,
-            params.limit,
-        ))
-        .await
-        .map_err(graph_err)?;
-
-    let mut posts = Vec::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        posts.push(mapky_post_from_row(&row));
-    }
-
+    let posts = fetch_mapky_posts_for_place(&osm_canonical, params.skip, params.limit).await?;
     Ok(Json(posts))
 }
 
@@ -949,27 +1461,8 @@ async fn place_tags(
     State(_ctx): State<PluginContext>,
     Path((osm_type, osm_id)): Path<(String, i64)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
-    use std::collections::HashMap;
-
     let osm_canonical = format!("{osm_type}/{osm_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_tags_for_place(&osm_canonical))
-        .await
-        .map_err(graph_err)?;
-
-    let mut found = false;
-    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
-
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        found = true;
-        let label: Option<String> = row.get("label").ok();
-        let tagger_id: Option<String> = row.get("tagger_id").ok();
-        if let (Some(l), Some(t)) = (label, tagger_id) {
-            tag_map.entry(l).or_default().push(t);
-        }
-    }
-
+    let (found, tags) = fetch_tags_for_place(&osm_canonical).await?;
     if !found {
         return Err((
             StatusCode::NOT_FOUND,
@@ -978,19 +1471,6 @@ async fn place_tags(
             }),
         ));
     }
-
-    let tags: Vec<PostTagDetails> = tag_map
-        .into_iter()
-        .map(|(label, taggers)| {
-            let taggers_count = taggers.len();
-            PostTagDetails {
-                label,
-                taggers,
-                taggers_count,
-            }
-        })
-        .collect();
-
     Ok(Json(tags))
 }
 
@@ -1120,7 +1600,11 @@ async fn user_incidents(
 ) -> ApiResult<Vec<IncidentDetails>> {
     let graph = get_neo4j_graph().map_err(graph_err)?;
     let mut stream = graph
-        .execute(queries::get::get_user_incidents(&user_id, params.skip, params.limit))
+        .execute(queries::get::get_user_incidents(
+            &user_id,
+            params.skip,
+            params.limit,
+        ))
         .await
         .map_err(graph_err)?;
 
@@ -1167,40 +1651,14 @@ async fn geo_captures_viewport(
     State(_ctx): State<PluginContext>,
     Query(params): Query<ViewportQuery>,
 ) -> ApiResult<Vec<GeoCaptureDetails>> {
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_geo_captures_in_viewport(
-            params.min_lat,
-            params.min_lon,
-            params.max_lat,
-            params.max_lon,
-            params.limit,
-        ))
-        .await
-        .map_err(graph_err)?;
-
-    let mut captures = Vec::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        captures.push(GeoCaptureDetails {
-            id: row.get("id").unwrap_or_default(),
-            author_id: row.get("author_id").unwrap_or_default(),
-            file_uri: row.get("file_uri").unwrap_or_default(),
-            kind: row.get("kind").unwrap_or_default(),
-            lat: row.get("lat").unwrap_or(0.0),
-            lon: row.get("lon").unwrap_or(0.0),
-            ele: row.get("ele").ok(),
-            heading: row.get("heading").ok(),
-            pitch: row.get("pitch").ok(),
-            fov: row.get("fov").ok(),
-            caption: row.get("caption").ok(),
-            sequence_uri: row.get("sequence_uri").ok(),
-            sequence_index: row.get("sequence_index").ok(),
-            captured_at: row.get("captured_at").ok(),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-            tags: None,
-        });
-    }
-
+    let captures = fetch_geo_captures_in_viewport(
+        params.min_lat,
+        params.min_lon,
+        params.max_lat,
+        params.max_lon,
+        params.limit,
+    )
+    .await?;
     Ok(Json(captures))
 }
 
@@ -1259,8 +1717,7 @@ async fn geo_capture_detail(
         }
     };
 
-    let (_found, tags) =
-        fetch_tags(queries::get::get_tags_for_geo_capture(&compound_id)).await?;
+    let (_found, tags) = fetch_tags(queries::get::get_tags_for_geo_capture(&compound_id)).await?;
     capture.tags = Some(tags);
     Ok(Json(capture))
 }
@@ -1364,8 +1821,7 @@ async fn geo_capture_tags(
     Path((author_id, capture_id)): Path<(String, String)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
     let compound_id = format!("{author_id}:{capture_id}");
-    let (found, tags) =
-        fetch_tags(queries::get::get_tags_for_geo_capture(&compound_id)).await?;
+    let (found, tags) = fetch_tags(queries::get::get_tags_for_geo_capture(&compound_id)).await?;
     if !found {
         return Err((
             StatusCode::NOT_FOUND,
@@ -1439,8 +1895,7 @@ async fn sequence_detail(
         }
     };
 
-    let (_found, tags) =
-        fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await?;
+    let (_found, tags) = fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await?;
     sequence.tags = Some(tags);
     Ok(Json(sequence))
 }
@@ -1502,8 +1957,7 @@ async fn sequence_tags(
     Path((author_id, sequence_id)): Path<(String, String)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
     let compound_id = format!("{author_id}:{sequence_id}");
-    let (found, tags) =
-        fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await?;
+    let (found, tags) = fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await?;
     if !found {
         return Err((
             StatusCode::NOT_FOUND,
@@ -1644,32 +2098,14 @@ async fn collections_viewport(
     State(_ctx): State<PluginContext>,
     Query(params): Query<ViewportQuery>,
 ) -> ApiResult<Vec<CollectionDetails>> {
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_collections_in_viewport(
-            params.min_lat,
-            params.min_lon,
-            params.max_lat,
-            params.max_lon,
-            params.limit,
-        ))
-        .await
-        .map_err(graph_err)?;
-
-    let mut collections = Vec::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        collections.push(CollectionDetails {
-            id: row.get("id").unwrap_or_default(),
-            author_id: row.get("author_id").unwrap_or_default(),
-            name: row.get("name").unwrap_or_default(),
-            description: row.get("description").ok(),
-            items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-        });
-    }
-
+    let collections = fetch_collections_in_viewport(
+        params.min_lat,
+        params.min_lon,
+        params.max_lat,
+        params.max_lon,
+        params.limit,
+    )
+    .await?;
     Ok(Json(collections))
 }
 
@@ -1739,26 +2175,7 @@ async fn collections_for_place(
     Path((osm_type, osm_id)): Path<(String, i64)>,
 ) -> ApiResult<Vec<CollectionDetails>> {
     let osm_canonical = format!("{osm_type}/{osm_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_collections_containing_place(&osm_canonical))
-        .await
-        .map_err(graph_err)?;
-
-    let mut collections = Vec::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        collections.push(CollectionDetails {
-            id: row.get("id").unwrap_or_default(),
-            author_id: row.get("author_id").unwrap_or_default(),
-            name: row.get("name").unwrap_or_default(),
-            description: row.get("description").ok(),
-            items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
-            indexed_at: row.get("indexed_at").unwrap_or(0),
-        });
-    }
-
+    let collections = fetch_collections_for_place(&osm_canonical).await?;
     Ok(Json(collections))
 }
 
@@ -1849,23 +2266,14 @@ async fn routes_viewport(
     State(_ctx): State<PluginContext>,
     Query(params): Query<ViewportQuery>,
 ) -> ApiResult<Vec<RouteDetails>> {
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_routes_in_viewport(
-            params.min_lat,
-            params.min_lon,
-            params.max_lat,
-            params.max_lon,
-            params.limit,
-        ))
-        .await
-        .map_err(graph_err)?;
-
-    let mut routes = Vec::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        routes.push(route_from_row(&row));
-    }
-
+    let routes = fetch_routes_in_viewport(
+        params.min_lat,
+        params.min_lon,
+        params.max_lat,
+        params.max_lon,
+        params.limit,
+    )
+    .await?;
     Ok(Json(routes))
 }
 
@@ -2032,40 +2440,17 @@ async fn place_routes(
     Query(params): Query<PaginationQuery>,
 ) -> ApiResult<Vec<RouteDetails>> {
     let osm_canonical = format!("{osm_type}/{osm_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-
-    // Resolve the place's lat/lon first — bounding-box-contains needs the
-    // point to test against. 404 if the place isn't indexed yet.
-    let mut place_stream = graph
-        .execute(queries::get::get_place_by_canonical(&osm_canonical))
-        .await
-        .map_err(graph_err)?;
-    let place_row = place_stream.try_next().await.map_err(graph_err)?;
-    let (lat, lon): (f64, f64) = match place_row {
-        Some(r) => (
-            r.get("lat").unwrap_or(0.0),
-            r.get("lon").unwrap_or(0.0),
-        ),
-        None => {
-            return Err((
+    let detail = fetch_place_detail_by_canonical(&osm_canonical)
+        .await?
+        .ok_or_else(|| {
+            (
                 StatusCode::NOT_FOUND,
                 Json(ApiError {
                     error: format!("Place {osm_canonical} not found"),
                 }),
-            ));
-        }
-    };
-
-    let mut stream = graph
-        .execute(queries::get::get_routes_near_point(lat, lon, params.limit))
-        .await
-        .map_err(graph_err)?;
-
-    let mut routes = Vec::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        routes.push(route_from_row(&row));
-    }
-
+            )
+        })?;
+    let routes = fetch_routes_near_point(detail.lat, detail.lon, params.limit).await?;
     Ok(Json(routes))
 }
 
@@ -2164,7 +2549,10 @@ async fn search_tags(
     // Search reviews by tag
     let mut reviews = Vec::new();
     let mut stream = graph
-        .execute(queries::get::search_reviews_by_tag(&query_str, params.limit))
+        .execute(queries::get::search_reviews_by_tag(
+            &query_str,
+            params.limit,
+        ))
         .await
         .map_err(graph_err)?;
     while let Some(row) = stream.try_next().await.map_err(graph_err)? {
