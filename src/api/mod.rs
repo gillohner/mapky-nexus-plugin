@@ -178,9 +178,13 @@ pub struct ViewportQuery {
     pub limit: i64,
 }
 
-/// Place-viewport query — adds zoom + optional filter flags so the
-/// handler can decide between cluster and individual rendering and
-/// narrow the result without a second round-trip.
+/// Place-viewport query — adds zoom + optional filter dimensions so
+/// the handler can decide between cluster and individual rendering
+/// and narrow the result without a second round-trip.
+///
+/// Filters:
+///   `activity` — comma-separated multi-select OR (`tagged,reviewed,posted,collected`).
+///   `min_rating` — 0.0–5.0 floor on the place's average rating.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct PlaceViewportQuery {
     pub min_lat: f64,
@@ -195,14 +199,14 @@ pub struct PlaceViewportQuery {
     pub zoom: u8,
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// Filter pills — when `true`, narrow to the matching set.
-    /// All-`false` (the default) means "show every place".
+    /// Comma-separated activity OR set. Recognized: `tagged`, `reviewed`,
+    /// `posted`, `collected`. Unknown tokens are silently ignored.
     #[serde(default)]
-    pub bitcoin: bool,
+    pub activity: Option<String>,
+    /// Minimum average rating on the user-facing 0–5 scale. Translated
+    /// to the internal 0–10 storage scale before hitting Cypher.
     #[serde(default)]
-    pub reviewed: bool,
-    #[serde(default)]
-    pub tagged: bool,
+    pub min_rating: Option<f64>,
 }
 
 fn default_viewport_zoom() -> u8 {
@@ -231,13 +235,14 @@ pub struct MultiViewportQuery {
     /// drop-in replacement for `/viewport`.
     #[serde(default)]
     pub include: Option<String>,
-    /// Place filter pills — only consulted when `include` selects `places`.
+    /// Comma-separated activity OR set, only consulted when
+    /// `include` selects `places`. See `PlaceViewportQuery::activity`.
     #[serde(default)]
-    pub bitcoin: bool,
+    pub activity: Option<String>,
+    /// 0.0–5.0 minimum-rating filter, only consulted when `include`
+    /// selects `places`.
     #[serde(default)]
-    pub reviewed: bool,
-    #[serde(default)]
-    pub tagged: bool,
+    pub min_rating: Option<f64>,
 }
 
 /// Composite-viewport response. Each field is `Some` only when the
@@ -321,6 +326,34 @@ fn parse_include(raw: Option<&str>) -> IncludeSet {
         set.places = true;
     }
     set
+}
+
+/// Parse the place-viewport filter query params into a `PlaceFilters`.
+/// `activity` is comma-separated; unknown tokens are ignored.
+/// `min_rating` is on the user-facing 0–5 scale and gets doubled to
+/// match the 0–10 storage scale before reaching Cypher.
+fn parse_place_filters(
+    activity: Option<&str>,
+    min_rating: Option<f64>,
+) -> queries::get::PlaceFilters {
+    let activities = activity
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(queries::get::PlaceActivity::parse)
+                .collect()
+        })
+        .unwrap_or_default();
+    let min_rating = min_rating
+        // Out-of-range values are clamped silently; the alternative is
+        // a 400 that's unhelpful for an exploratory filter UI.
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .map(|r| (r * 2.0).clamp(0.0, 10.0));
+    queries::get::PlaceFilters {
+        activities,
+        min_rating,
+    }
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -596,7 +629,7 @@ async fn fetch_places_in_viewport(
     max_lon: f64,
     zoom: u8,
     limit: i64,
-    filters: queries::get::PlaceFilters,
+    filters: &queries::get::PlaceFilters,
 ) -> Result<ViewportResponse, (StatusCode, Json<ApiError>)> {
     let graph = get_neo4j_graph().map_err(graph_err)?;
 
@@ -879,9 +912,8 @@ async fn fetch_routes_near_point(
         ("max_lon" = f64, Query, description = "Maximum longitude"),
         ("zoom" = Option<u8>, Query, description = "Current MapLibre zoom (0-22). Switches to cluster mode below 13."),
         ("limit" = Option<i64>, Query, description = "Max rows (clusters or places); default 100"),
-        ("bitcoin" = Option<bool>, Query, description = "Narrow to Bitcoin-accepting places"),
-        ("reviewed" = Option<bool>, Query, description = "Narrow to places with at least one review"),
-        ("tagged" = Option<bool>, Query, description = "Narrow to places with at least one tag"),
+        ("activity" = Option<String>, Query, description = "Comma-separated activity OR set: tagged,reviewed,posted,collected"),
+        ("min_rating" = Option<f64>, Query, description = "Minimum average rating (0.0–5.0)"),
     ),
     responses(
         (status = 200, description = "Cluster summary or individual places", body = ViewportResponse),
@@ -892,11 +924,7 @@ async fn viewport(
     State(_ctx): State<PluginContext>,
     Query(params): Query<PlaceViewportQuery>,
 ) -> ApiResult<ViewportResponse> {
-    let filters = queries::get::PlaceFilters {
-        bitcoin: params.bitcoin,
-        reviewed: params.reviewed,
-        tagged: params.tagged,
-    };
+    let filters = parse_place_filters(params.activity.as_deref(), params.min_rating);
     let resp = fetch_places_in_viewport(
         params.min_lat,
         params.min_lon,
@@ -904,7 +932,7 @@ async fn viewport(
         params.max_lon,
         params.zoom,
         params.limit,
-        filters,
+        &filters,
     )
     .await?;
     Ok(Json(resp))
@@ -933,9 +961,8 @@ async fn viewport(
         ("zoom" = Option<u8>, Query, description = "Zoom for the place layer's cluster decision (defaults to 13)"),
         ("limit" = Option<i64>, Query, description = "Max rows per layer; default 100"),
         ("include" = Option<String>, Query, description = "Comma-separated layer names: places,collections,captures,routes. Default: places."),
-        ("bitcoin" = Option<bool>, Query, description = "Place filter: BTC-accepting only"),
-        ("reviewed" = Option<bool>, Query, description = "Place filter: at least one review"),
-        ("tagged" = Option<bool>, Query, description = "Place filter: at least one tag"),
+        ("activity" = Option<String>, Query, description = "Place filter: comma-separated activity OR set (tagged,reviewed,posted,collected)"),
+        ("min_rating" = Option<f64>, Query, description = "Place filter: minimum average rating (0.0–5.0)"),
     ),
     responses(
         (status = 200, description = "Composite envelope with one branch per requested layer", body = MultiViewportResponse),
@@ -947,11 +974,7 @@ async fn viewport_multi(
     Query(params): Query<MultiViewportQuery>,
 ) -> ApiResult<MultiViewportResponse> {
     let inc = parse_include(params.include.as_deref());
-    let filters = queries::get::PlaceFilters {
-        bitcoin: params.bitcoin,
-        reviewed: params.reviewed,
-        tagged: params.tagged,
-    };
+    let filters = parse_place_filters(params.activity.as_deref(), params.min_rating);
 
     // Build a future per layer. When the layer is not requested, the
     // future short-circuits to `Ok(None)` — skipped by `try_join!` at
@@ -965,7 +988,7 @@ async fn viewport_multi(
                 params.max_lon,
                 params.zoom,
                 params.limit,
-                filters,
+                &filters,
             )
             .await
             .map(Some)

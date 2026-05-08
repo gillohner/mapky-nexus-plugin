@@ -2,35 +2,93 @@
 
 use nexus_common::db::graph::Query;
 
-/// Filters layered on top of the bbox. Each one when `true` narrows
-/// the result to places that satisfy the predicate. All-`false` means
-/// "no narrowing" and the query returns every geocoded place in bbox.
+/// Activity dimensions a place can satisfy. Used as a multi-select OR
+/// set: a place matches the filter if it satisfies ANY of the selected
+/// activities. Replaces the old AND-of-three-booleans pattern, which
+/// hit an impossible-intersection trap whenever the user wanted "any
+/// place that has Mapky engagement" (a place with only posts, no
+/// reviews/tags, was unreachable through the old filter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlaceActivity {
+    /// `:User-[:TAGGED]->Place` exists (the place has at least one tag).
+    Tagged,
+    /// `:MapkyAppReview-[:ABOUT]->Place` exists.
+    Reviewed,
+    /// `:MapkyAppPost-[:ABOUT]->Place` exists (non-review post, comment, or media).
+    Posted,
+    /// `:MapkyAppCollection-[:CONTAINS]->Place` exists.
+    Collected,
+}
+
+impl PlaceActivity {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tagged" => Some(Self::Tagged),
+            "reviewed" => Some(Self::Reviewed),
+            "posted" => Some(Self::Posted),
+            "collected" => Some(Self::Collected),
+            _ => None,
+        }
+    }
+
+    /// Cypher predicate against the bound `p:Place` row. Tagged and
+    /// Reviewed read the denormalized counters on the Place node (cheap);
+    /// Posted and Collected probe edges via `EXISTS { ... }` (one
+    /// expand each — Neo4j short-circuits on first hit).
+    fn cypher_predicate(self) -> &'static str {
+        match self {
+            Self::Tagged => "p.tag_count > 0",
+            Self::Reviewed => "p.review_count > 0",
+            Self::Posted => "EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) }",
+            Self::Collected => "EXISTS { (:MapkyAppCollection)-[:CONTAINS]->(p) }",
+        }
+    }
+}
+
+/// Filters layered on top of the bbox.
 ///
-/// Kept as a struct (rather than positional bools) so the call sites
-/// stay readable when we add another filter dimension later.
-#[derive(Debug, Clone, Copy, Default)]
+/// `activities` — multi-select OR. Empty (default) means "no activity
+/// narrowing". Any populated entry narrows to places matching at
+/// least one of the listed activities.
+///
+/// `min_rating` — optional 0–10 floor (avg_rating is stored on the
+/// 0–10 scale so half-stars stay precise; the API layer multiplies a
+/// 0–5 user input by 2 before passing it through).
+#[derive(Debug, Clone, Default)]
 pub struct PlaceFilters {
-    pub bitcoin: bool,
-    pub reviewed: bool,
-    pub tagged: bool,
+    pub activities: Vec<PlaceActivity>,
+    pub min_rating: Option<f64>,
 }
 
 impl PlaceFilters {
     /// Build the Cypher fragment that AND's onto the base bbox WHERE.
     /// Empty when no filters are active so the simple case stays clean.
-    fn cypher_clause(&self) -> &'static str {
-        match (self.bitcoin, self.reviewed, self.tagged) {
-            (false, false, false) => "",
-            (true, false, false) => " AND p.accepts_bitcoin = true",
-            (false, true, false) => " AND p.review_count > 0",
-            (false, false, true) => " AND p.tag_count > 0",
-            (true, true, false) => " AND p.accepts_bitcoin = true AND p.review_count > 0",
-            (true, false, true) => " AND p.accepts_bitcoin = true AND p.tag_count > 0",
-            (false, true, true) => " AND p.review_count > 0 AND p.tag_count > 0",
-            (true, true, true) => {
-                " AND p.accepts_bitcoin = true AND p.review_count > 0 AND p.tag_count > 0"
-            }
+    fn cypher_clause(&self) -> String {
+        let mut out = String::new();
+        if !self.activities.is_empty() {
+            // De-dup while preserving order — repeated `?activity=tagged`
+            // shouldn't OR the same predicate twice.
+            let mut seen = std::collections::HashSet::new();
+            let or_chain = self
+                .activities
+                .iter()
+                .filter(|a| seen.insert(**a))
+                .map(|a| a.cypher_predicate())
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            out.push_str(" AND (");
+            out.push_str(&or_chain);
+            out.push(')');
         }
+        if let Some(min) = self.min_rating {
+            // avg_rating stored 0–10; caller is responsible for the
+            // 0–5 → 0–10 conversion.
+            use std::fmt::Write;
+            // f64 formatting via write!/format! is locale-independent and
+            // emits a `.` decimal — safe to inline directly into Cypher.
+            let _ = write!(&mut out, " AND p.avg_rating >= {min}");
+        }
+        out
     }
 }
 
@@ -41,7 +99,7 @@ pub fn get_places_in_viewport(
     min_lon: f64,
     max_lat: f64,
     max_lon: f64,
-    filters: PlaceFilters,
+    filters: &PlaceFilters,
     limit: i64,
 ) -> Query {
     let cypher = format!(
@@ -94,7 +152,7 @@ pub fn get_place_clusters_in_viewport(
     max_lat: f64,
     max_lon: f64,
     cell: f64,
-    filters: PlaceFilters,
+    filters: &PlaceFilters,
     limit: i64,
 ) -> Query {
     let cypher = format!(
@@ -1176,4 +1234,79 @@ pub fn get_reviews_for_place(osm_canonical: &str, skip: i64, limit: i64) -> Quer
     .param("osm_canonical", osm_canonical)
     .param("skip", skip)
     .param("limit", limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_filter_emits_no_clause() {
+        let f = PlaceFilters::default();
+        assert_eq!(f.cypher_clause(), "");
+    }
+
+    #[test]
+    fn single_activity_wraps_in_parens() {
+        let f = PlaceFilters {
+            activities: vec![PlaceActivity::Tagged],
+            min_rating: None,
+        };
+        assert_eq!(f.cypher_clause(), " AND (p.tag_count > 0)");
+    }
+
+    #[test]
+    fn multiple_activities_or_chain() {
+        let f = PlaceFilters {
+            activities: vec![PlaceActivity::Tagged, PlaceActivity::Reviewed, PlaceActivity::Posted],
+            min_rating: None,
+        };
+        assert_eq!(
+            f.cypher_clause(),
+            " AND (p.tag_count > 0 OR p.review_count > 0 OR EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) })"
+        );
+    }
+
+    #[test]
+    fn duplicate_activities_dedup() {
+        let f = PlaceFilters {
+            activities: vec![PlaceActivity::Tagged, PlaceActivity::Tagged, PlaceActivity::Reviewed],
+            min_rating: None,
+        };
+        assert_eq!(
+            f.cypher_clause(),
+            " AND (p.tag_count > 0 OR p.review_count > 0)"
+        );
+    }
+
+    #[test]
+    fn min_rating_renders_decimal() {
+        let f = PlaceFilters {
+            activities: vec![],
+            min_rating: Some(7.5),
+        };
+        assert_eq!(f.cypher_clause(), " AND p.avg_rating >= 7.5");
+    }
+
+    #[test]
+    fn activity_and_min_rating_combine() {
+        let f = PlaceFilters {
+            activities: vec![PlaceActivity::Reviewed],
+            min_rating: Some(8.0),
+        };
+        assert_eq!(
+            f.cypher_clause(),
+            " AND (p.review_count > 0) AND p.avg_rating >= 8"
+        );
+    }
+
+    #[test]
+    fn parse_recognized_activities() {
+        assert_eq!(PlaceActivity::parse("tagged"), Some(PlaceActivity::Tagged));
+        assert_eq!(PlaceActivity::parse("reviewed"), Some(PlaceActivity::Reviewed));
+        assert_eq!(PlaceActivity::parse("posted"), Some(PlaceActivity::Posted));
+        assert_eq!(PlaceActivity::parse("collected"), Some(PlaceActivity::Collected));
+        assert_eq!(PlaceActivity::parse("nonsense"), None);
+        assert_eq!(PlaceActivity::parse(""), None);
+    }
 }
