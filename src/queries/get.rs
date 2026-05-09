@@ -193,6 +193,16 @@ pub fn get_place_clusters_in_viewport(
     filters: &PlaceFilters,
     limit: i64,
 ) -> Query {
+    // Cluster lat/lon = cell MIDPOINT, not centroid-of-mass. Two
+    // benefits: (1) adjacent grid cells with places near the shared
+    // edge no longer produce nearly-overlapping bubbles — clusters
+    // are exactly one `cell` apart on the grid; (2) the BTC overlay
+    // and Mapky place layers share the same midpoint formula, so a
+    // place that's both Mapky-engaged AND BTC produces aligned
+    // bubbles at the exact same lat/lon (different colors, stacked,
+    // conveying "this cell has both signals"). Centroid-based
+    // positioning drifted between layers because their per-layer
+    // sets differ.
     let cypher = format!(
         "MATCH (p:Place)
          WHERE p.geocoded = true
@@ -206,12 +216,11 @@ pub fn get_place_clusters_in_viewport(
               floor(p.lon / $cell) AS lon_idx
          WITH lat_idx, lon_idx,
               count(p) AS total,
-              sum(CASE WHEN coalesce(p.accepts_bitcoin, false) THEN 1 ELSE 0 END) AS btc,
-              sum(CASE WHEN p.review_count > 0 THEN 1 ELSE 0 END) AS reviewed,
-              sum(CASE WHEN p.tag_count > 0 THEN 1 ELSE 0 END) AS tagged,
-              avg(p.lat) AS lat,
-              avg(p.lon) AS lon
-         RETURN lat, lon, total, btc, reviewed, tagged
+              sum(CASE WHEN p.review_count > 0 THEN 1 ELSE 0 END) AS reviewed
+         RETURN (lat_idx + 0.5) * $cell AS lat,
+                (lon_idx + 0.5) * $cell AS lon,
+                total,
+                reviewed
          ORDER BY total DESC
          LIMIT $limit",
         filters = filters.cypher_clause()
@@ -260,6 +269,52 @@ pub fn get_btc_places_in_viewport(
     .param("min_lon", min_lon)
     .param("max_lat", max_lat)
     .param("max_lon", max_lon)
+    .param("limit", limit)
+}
+
+/// Cluster BTC-accepting Place nodes into a `cell`-sized lat/lon
+/// grid. Mirrors `get_place_clusters_in_viewport` but filters on
+/// `accepts_bitcoin = true` and returns just `(lat, lon, total)` —
+/// the BTC overlay's cluster bubbles don't carry sub-counts since
+/// the overlay's only signal IS "BTC merchant".
+///
+/// Places that are both Mapky-engaged AND BTC are intentionally in
+/// both cluster sets — once here, once in `get_place_clusters_in_viewport`.
+/// The two clusters render in different colors (orange vs teal) so
+/// the overlap is visible to the user.
+pub fn get_btc_place_clusters_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    cell: f64,
+    limit: i64,
+) -> Query {
+    Query::new(
+        "mapky_btc_viewport_clusters",
+        "MATCH (p:Place)
+         WHERE p.accepts_bitcoin = true
+           AND p.geocoded = true
+           AND point.withinBBox(
+             p.location,
+             point({latitude: $min_lat, longitude: $min_lon}),
+             point({latitude: $max_lat, longitude: $max_lon})
+         )
+         WITH p,
+              floor(p.lat / $cell) AS lat_idx,
+              floor(p.lon / $cell) AS lon_idx
+         WITH lat_idx, lon_idx, count(p) AS total
+         RETURN (lat_idx + 0.5) * $cell AS lat,
+                (lon_idx + 0.5) * $cell AS lon,
+                total
+         ORDER BY total DESC
+         LIMIT $limit",
+    )
+    .param("min_lat", min_lat)
+    .param("min_lon", min_lon)
+    .param("max_lat", max_lat)
+    .param("max_lon", max_lon)
+    .param("cell", cell)
     .param("limit", limit)
 }
 

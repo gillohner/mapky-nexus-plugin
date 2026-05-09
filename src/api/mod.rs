@@ -160,7 +160,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         PostsQuery, PaginationQuery, NearbyQuery,
         TagSearchQuery, TagSearchResponse,
         OsmLookupQuery, OsmSearchQuery, OsmReverseQuery, NominatimLookup,
-        BitcoinPoi, SyncStatus,
+        BitcoinPoi, BitcoinCluster, BtcViewportQuery, BtcViewportResponse, SyncStatus,
         PlaceCluster, ViewportResponse,
     ))
 )]
@@ -174,6 +174,22 @@ pub struct ViewportQuery {
     pub min_lon: f64,
     pub max_lat: f64,
     pub max_lon: f64,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+/// BTC overlay viewport query — adds zoom for the cluster/individual
+/// switch. Mirrors the place layer's `PlaceViewportQuery::zoom` so a
+/// place at the same cell across both layers gets the same cluster
+/// midpoint coordinates.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BtcViewportQuery {
+    pub min_lat: f64,
+    pub min_lon: f64,
+    pub max_lat: f64,
+    pub max_lon: f64,
+    #[serde(default = "default_viewport_zoom")]
+    pub zoom: u8,
     #[serde(default = "default_limit")]
     pub limit: i64,
 }
@@ -474,17 +490,28 @@ fn default_reverse_zoom() -> u32 {
     18
 }
 
-/// One row from the cluster aggregation. Carries enough sub-counts
-/// for the frontend to draw a per-cluster ratio bar (BTC / reviewed /
-/// tagged) without a second query.
+/// One row from the place-cluster aggregation. `total` is the cluster's
+/// place count, `reviewed` is the sub-count of cells with at least one
+/// reviewed place — drives the cluster bubble's accent ring intensity.
+/// `lat`/`lon` are the cell midpoint (deterministic: two layers'
+/// clusters at the same cell align exactly), not the centroid.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PlaceCluster {
     pub lat: f64,
     pub lon: f64,
     pub total: i64,
-    pub btc: i64,
     pub reviewed: i64,
-    pub tagged: i64,
+}
+
+/// One row from the BTC-cluster aggregation. Same shape as
+/// `PlaceCluster` minus the reviewed sub-count — the BTC overlay's
+/// only signal IS "BTC merchant", so cluster bubbles don't carry
+/// further breakdowns.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BitcoinCluster {
+    pub lat: f64,
+    pub lon: f64,
+    pub total: i64,
 }
 
 /// Discriminated envelope for the place-viewport endpoint. The frontend
@@ -503,6 +530,26 @@ pub enum ViewportResponse {
     },
     /// `zoom >= cluster_zoom_threshold` — individual place markers.
     Places { places: Vec<PlaceDetails> },
+}
+
+/// Discriminated envelope for the BTC overlay endpoint. Mirrors
+/// `ViewportResponse` so the frontend can switch between cluster
+/// bubbles (low zoom) and individual orange dots (high zoom) off a
+/// single shape — same query key, no client-side decision about which
+/// mode the server picked.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BtcViewportResponse {
+    /// `zoom < cluster_zoom_threshold` — grid-aggregated overview.
+    Clusters {
+        clusters: Vec<BitcoinCluster>,
+        /// Cell size (degrees) used for binning. Same value as the
+        /// place layer's cell at the same zoom — clusters in the same
+        /// cell align across layers.
+        cell: f64,
+    },
+    /// `zoom >= cluster_zoom_threshold` — individual BTC POIs.
+    Places { places: Vec<BitcoinPoi> },
 }
 
 /// MapLibre zoom at or above which we switch from cluster bubbles to
@@ -679,9 +726,7 @@ async fn fetch_places_in_viewport(
             lat: row.get("lat").unwrap_or(0.0),
             lon: row.get("lon").unwrap_or(0.0),
             total: row.get("total").unwrap_or(0),
-            btc: row.get("btc").unwrap_or(0),
             reviewed: row.get("reviewed").unwrap_or(0),
-            tagged: row.get("tagged").unwrap_or(0),
         });
     }
     Ok(ViewportResponse::Clusters { clusters, cell })
@@ -2843,11 +2888,21 @@ pub struct BitcoinPoi {
     pub lightning_contactless: bool,
 }
 
-/// List Bitcoin-accepting places within a geographic bounding box.
+/// Bitcoin-accepting places within a geographic bounding box.
+///
+/// Zoom-aware envelope: clusters at zoom < `CLUSTER_ZOOM_THRESHOLD`,
+/// individual POIs at or above. Mirrors `/v0/mapky/viewport` so the
+/// frontend can switch rendering modes off a single discriminated
+/// response — same shape, one query key.
 ///
 /// Served from `:Place` nodes flagged `accepts_bitcoin = true` by the
 /// periodic BTCMap sync (see `btcmap_sync.rs`). No upstream Overpass
 /// call on the request path — sub-100 ms for any user, any region.
+///
+/// Cluster cells share the place layer's `cluster_cell_for_zoom`
+/// formula and snap to cell midpoints, so a place that's both
+/// Mapky-engaged AND BTC produces aligned cluster bubbles in both
+/// layers (different colors at the same lat/lon).
 #[utoipa::path(
     get,
     path = "/v0/mapky/btc/viewport",
@@ -2857,18 +2912,43 @@ pub struct BitcoinPoi {
         ("min_lon" = f64, Query, description = "Minimum longitude"),
         ("max_lat" = f64, Query, description = "Maximum latitude"),
         ("max_lon" = f64, Query, description = "Maximum longitude"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 100)")
+        ("zoom" = Option<u8>, Query, description = "Current MapLibre zoom (0-22). Switches to cluster mode below 11."),
+        ("limit" = Option<i64>, Query, description = "Max rows (clusters or POIs); default 100"),
     ),
     responses(
-        (status = 200, description = "Bitcoin-accepting POIs in viewport", body = Vec<BitcoinPoi>),
+        (status = 200, description = "Cluster summary or individual BTC POIs", body = BtcViewportResponse),
         (status = 500, description = "Internal server error", body = ApiError)
     )
 )]
 async fn btc_viewport(
     State(_ctx): State<PluginContext>,
-    Query(params): Query<ViewportQuery>,
-) -> ApiResult<Vec<BitcoinPoi>> {
+    Query(params): Query<BtcViewportQuery>,
+) -> ApiResult<BtcViewportResponse> {
     let graph = get_neo4j_graph().map_err(graph_err)?;
+
+    if params.zoom < CLUSTER_ZOOM_THRESHOLD {
+        let cell = cluster_cell_for_zoom(params.zoom);
+        let mut stream = graph
+            .execute(queries::get::get_btc_place_clusters_in_viewport(
+                params.min_lat,
+                params.min_lon,
+                params.max_lat,
+                params.max_lon,
+                cell,
+                params.limit,
+            ))
+            .await
+            .map_err(graph_err)?;
+        let mut clusters = Vec::new();
+        while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+            clusters.push(BitcoinCluster {
+                lat: row.get("lat").unwrap_or(0.0),
+                lon: row.get("lon").unwrap_or(0.0),
+                total: row.get("total").unwrap_or(0),
+            });
+        }
+        return Ok(Json(BtcViewportResponse::Clusters { clusters, cell }));
+    }
 
     let mut stream = graph
         .execute(queries::get::get_btc_places_in_viewport(
@@ -2895,7 +2975,7 @@ async fn btc_viewport(
         });
     }
 
-    Ok(Json(places))
+    Ok(Json(BtcViewportResponse::Places { places }))
 }
 
 /// Inspect BTCMap sync state: configured upstream URL, refresh
