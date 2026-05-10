@@ -32,7 +32,7 @@
 use mapky_app_specs::traits::{HasIdPath as MapkyHasIdPath, TimestampId};
 use mapky_app_specs::{MapkyAppPost, MapkyAppPostKind};
 use pubky::{Keypair, PubkyHttpClient, PublicKey};
-use pubky_app_specs::traits::{HashId, HasIdPath as PubkyHasIdPath};
+use pubky_app_specs::traits::{HasIdPath as PubkyHasIdPath, HashId};
 use pubky_app_specs::PubkyAppTag;
 
 /// The homeserver public key from pubky-docker config.toml.
@@ -194,16 +194,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (1, 5, "great-food"),  // user2 → post6
     ];
 
-    println!("\n── Writing {} tags to homeserver ─────────────────", tag_targets.len());
+    println!(
+        "\n── Writing {} tags to homeserver ─────────────────",
+        tag_targets.len()
+    );
     for (user_idx, post_idx, label) in tag_targets {
         let (ref tagger_pk, ref tagger_session) = sessions[*user_idx];
         let (ref post_author_pk, ref post_id) = written_posts[*post_idx];
 
         // Build the full pubky URI for the target post
-        let post_uri = format!(
-            "pubky://{}/pub/mapky.app/posts/{}",
-            post_author_pk, post_id
-        );
+        let post_uri = format!("pubky://{}/pub/mapky.app/posts/{}", post_author_pk, post_id);
 
         let tag = PubkyAppTag::new(post_uri, label.to_string());
         let tag_id = tag.create_id();
@@ -213,10 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let response = tagger_session.storage().put(&path, body).await?;
 
         let status = response.status();
-        println!(
-            "  [{status}] {:.12}… → {path}  (label: {label})",
-            tagger_pk
-        );
+        println!("  [{status}] {:.12}… → {path}  (label: {label})", tagger_pk);
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -241,7 +238,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("  curl -s 'localhost:8080/v0/mapky/viewport?min_lat=-90&min_lon=-180&max_lat=90&max_lon=180&limit=100' | jq .");
     println!("  curl -s 'localhost:8080/v0/mapky/place/node/1573053883/posts' | jq .  # Hafenbar, Luzern");
     println!("  curl -s 'localhost:8080/v0/mapky/place/way/618456759/posts' | jq .    # Bitcoin Ekasi, Mossel Bay");
-    println!("  curl -s 'localhost:8080/v0/mapky/place/node/3646146894/posts' | jq .  # Insider, Zürich");
+    println!(
+        "  curl -s 'localhost:8080/v0/mapky/place/node/3646146894/posts' | jq .  # Insider, Zürich"
+    );
     println!("  curl -s 'localhost:8080/v0/mapky/posts/{post1_author}/{post1_id}/tags' | jq .  # tags on post1 (Hafenbar review)");
     println!();
     println!("  User public keys (for events-stream debugging):");

@@ -1363,7 +1363,11 @@ mod tests {
     #[test]
     fn multiple_activities_or_chain() {
         let f = PlaceFilters {
-            activities: vec![PlaceActivity::Tagged, PlaceActivity::Reviewed, PlaceActivity::Posted],
+            activities: vec![
+                PlaceActivity::Tagged,
+                PlaceActivity::Reviewed,
+                PlaceActivity::Posted,
+            ],
             include_unengaged: false,
             min_rating: None,
         };
@@ -1376,7 +1380,11 @@ mod tests {
     #[test]
     fn duplicate_activities_dedup() {
         let f = PlaceFilters {
-            activities: vec![PlaceActivity::Tagged, PlaceActivity::Tagged, PlaceActivity::Reviewed],
+            activities: vec![
+                PlaceActivity::Tagged,
+                PlaceActivity::Tagged,
+                PlaceActivity::Reviewed,
+            ],
             include_unengaged: false,
             min_rating: None,
         };
@@ -1425,9 +1433,15 @@ mod tests {
     #[test]
     fn parse_recognized_activities() {
         assert_eq!(PlaceActivity::parse("tagged"), Some(PlaceActivity::Tagged));
-        assert_eq!(PlaceActivity::parse("reviewed"), Some(PlaceActivity::Reviewed));
+        assert_eq!(
+            PlaceActivity::parse("reviewed"),
+            Some(PlaceActivity::Reviewed)
+        );
         assert_eq!(PlaceActivity::parse("posted"), Some(PlaceActivity::Posted));
-        assert_eq!(PlaceActivity::parse("collected"), Some(PlaceActivity::Collected));
+        assert_eq!(
+            PlaceActivity::parse("collected"),
+            Some(PlaceActivity::Collected)
+        );
         assert_eq!(PlaceActivity::parse("nonsense"), None);
         assert_eq!(PlaceActivity::parse(""), None);
     }

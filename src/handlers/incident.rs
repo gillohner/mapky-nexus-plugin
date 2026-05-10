@@ -25,9 +25,7 @@ pub async fn sync_put(
         .await?;
 
     // 2. Create the incident node + REPORTED edge.
-    graph
-        .run(queries::put::create_incident(&details))
-        .await?;
+    graph.run(queries::put::create_incident(&details)).await?;
 
     Ok(())
 }

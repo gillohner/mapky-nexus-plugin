@@ -54,8 +54,7 @@ use tracing::warn;
 const REDIS_KEY_PREFIX: &str = "mapky:osm:v2:lookup:";
 const DEFAULT_NOMINATIM_URL: &str = "https://nominatim.openstreetmap.org";
 const DEFAULT_OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
-const DEFAULT_USER_AGENT: &str =
-    "mapky-nexus-plugin/0.1 (+https://github.com/gillohner/mapky)";
+const DEFAULT_USER_AGENT: &str = "mapky-nexus-plugin/0.1 (+https://github.com/gillohner/mapky)";
 const DEFAULT_MIN_INTERVAL_MS: u64 = 1000;
 const DEFAULT_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// Empty placeholders cache for a much shorter window than hits — they
@@ -438,9 +437,7 @@ fn lookup_from_overpass(elem: OverpassElement) -> NominatimLookup {
 /// the Nominatim placeholder. Same rate-limit gate as Nominatim so
 /// fallbacks don't squeeze the public Overpass instance any harder
 /// than the primary path.
-async fn overpass_fallback(
-    refs: &[(String, i64)],
-) -> HashMap<String, NominatimLookup> {
+async fn overpass_fallback(refs: &[(String, i64)]) -> HashMap<String, NominatimLookup> {
     let mut out: HashMap<String, NominatimLookup> = HashMap::new();
     if refs.is_empty() {
         return out;
@@ -548,10 +545,7 @@ pub async fn batch_lookup_cached(refs: &[(String, i64)]) -> Vec<NominatimLookup>
     // ── 1. Redis cache pass ──────────────────────────────────────
     // MGET in one round-trip. Index alignment relies on the keys
     // being in the same order as `refs`.
-    let keys: Vec<String> = refs
-        .iter()
-        .map(|(t, id)| cache_key(t, *id))
-        .collect();
+    let keys: Vec<String> = refs.iter().map(|(t, id)| cache_key(t, *id)).collect();
     if let Ok(mut conn) = get_redis_conn().await {
         let raw: Result<Vec<Option<String>>, _> = conn.mget(&keys).await;
         if let Ok(values) = raw {
@@ -591,9 +585,7 @@ pub async fn batch_lookup_cached(refs: &[(String, i64)]) -> Vec<NominatimLookup>
         return out
             .into_iter()
             .enumerate()
-            .map(|(i, opt)| {
-                opt.unwrap_or_else(|| empty_lookup(&refs[i].0, refs[i].1))
-            })
+            .map(|(i, opt)| opt.unwrap_or_else(|| empty_lookup(&refs[i].0, refs[i].1)))
             .collect();
     }
 
@@ -637,9 +629,10 @@ pub async fn batch_lookup_cached(refs: &[(String, i64)]) -> Vec<NominatimLookup>
         );
         let resp = nominatim_client().get(&url).send().await;
         let (raw, ok) = match resp {
-            Ok(r) if r.status().is_success() => {
-                (r.json::<Vec<NominatimRaw>>().await.unwrap_or_default(), true)
-            }
+            Ok(r) if r.status().is_success() => (
+                r.json::<Vec<NominatimRaw>>().await.unwrap_or_default(),
+                true,
+            ),
             Ok(r) => {
                 warn!(status = ?r.status(), "Nominatim batch lookup non-2xx");
                 (Vec::new(), false)

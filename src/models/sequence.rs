@@ -36,7 +36,12 @@ impl SequenceDetails {
         sequence_id: &str,
     ) -> Self {
         let (min_lat, min_lon, max_lat, max_lon) = match &sequence.bbox {
-            Some(b) => (Some(b.min_lat), Some(b.min_lon), Some(b.max_lat), Some(b.max_lon)),
+            Some(b) => (
+                Some(b.min_lat),
+                Some(b.min_lon),
+                Some(b.max_lat),
+                Some(b.max_lon),
+            ),
             None => (None, None, None, None),
         };
 

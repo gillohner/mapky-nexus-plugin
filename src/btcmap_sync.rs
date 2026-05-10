@@ -33,8 +33,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use deadpool_redis::redis::AsyncCommands;
+use neo4rs::{
+    BoltBoolean, BoltFloat, BoltInteger, BoltList, BoltMap, BoltNull, BoltString, BoltType,
+};
 use nexus_common::db::{get_neo4j_graph, get_redis_conn};
-use neo4rs::{BoltBoolean, BoltFloat, BoltInteger, BoltList, BoltMap, BoltNull, BoltString, BoltType};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -66,8 +68,8 @@ struct SyncConfig {
 fn config() -> &'static SyncConfig {
     static CFG: OnceLock<SyncConfig> = OnceLock::new();
     CFG.get_or_init(|| {
-        let url = std::env::var("MAPKY_BTCMAP_URL")
-            .unwrap_or_else(|_| DEFAULT_BTCMAP_URL.to_string());
+        let url =
+            std::env::var("MAPKY_BTCMAP_URL").unwrap_or_else(|_| DEFAULT_BTCMAP_URL.to_string());
         let refresh_secs = std::env::var("MAPKY_BTCMAP_REFRESH_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -281,7 +283,11 @@ async fn run_sync_inner() -> Result<SyncStats, Box<dyn std::error::Error + Send 
         0
     });
 
-    Ok(SyncStats { fetched, upserted, cleared })
+    Ok(SyncStats {
+        fetched,
+        upserted,
+        cleared,
+    })
 }
 
 /// Pre-seed Redis lookup cache. Returns count of successful writes.
@@ -426,16 +432,33 @@ impl PlaceRow {
         }
 
         let name = osm.tags.get("name").cloned().filter(|n| !n.is_empty());
-        let xbt = osm.tags.get("currency:XBT").map(|s| s == "yes").unwrap_or(false);
-        let legacy_bitcoin = osm.tags.get("payment:bitcoin").map(|s| s == "yes").unwrap_or(false);
+        let xbt = osm
+            .tags
+            .get("currency:XBT")
+            .map(|s| s == "yes")
+            .unwrap_or(false);
+        let legacy_bitcoin = osm
+            .tags
+            .get("payment:bitcoin")
+            .map(|s| s == "yes")
+            .unwrap_or(false);
         // Filter: BTCMap occasionally surfaces elements that have lost
         // their Bitcoin tags between dumps. Skip them — the cleanup
         // sweep will retire any stale Neo4j flags on the next pass.
         if !xbt && !legacy_bitcoin {
             return None;
         }
-        let onchain = osm.tags.get("payment:onchain").map(|s| s == "yes").unwrap_or(false) || legacy_bitcoin;
-        let lightning = osm.tags.get("payment:lightning").map(|s| s == "yes").unwrap_or(false);
+        let onchain = osm
+            .tags
+            .get("payment:onchain")
+            .map(|s| s == "yes")
+            .unwrap_or(false)
+            || legacy_bitcoin;
+        let lightning = osm
+            .tags
+            .get("payment:lightning")
+            .map(|s| s == "yes")
+            .unwrap_or(false);
         let lightning_contactless = osm
             .tags
             .get("payment:lightning_contactless")
@@ -467,7 +490,11 @@ fn nominatim_lookup_from_row(row: &PlaceRow) -> NominatimLookup {
     // (`restaurant`, `cafe`, …). Mirror that mapping from OSM tags.
     let (category, kind) = ["amenity", "shop", "tourism", "leisure", "office", "craft"]
         .iter()
-        .find_map(|k| row.tags.get(*k).map(|v| (Some(k.to_string()), Some(v.clone()))))
+        .find_map(|k| {
+            row.tags
+                .get(*k)
+                .map(|v| (Some(k.to_string()), Some(v.clone())))
+        })
         .unwrap_or((None, None));
 
     // Strip the `addr:` prefix to match Nominatim's address-map shape
@@ -628,11 +655,26 @@ mod tests {
         assert_eq!(lookup.category.as_deref(), Some("amenity"));
         assert_eq!(lookup.kind.as_deref(), Some("cafe"));
         assert_eq!(lookup.address.get("city").map(String::as_str), Some("Bern"));
-        assert_eq!(lookup.address.get("street").map(String::as_str), Some("Bahnhofstrasse"));
-        assert!(!lookup.address.contains_key("addr:city"), "addr: prefix must be stripped");
+        assert_eq!(
+            lookup.address.get("street").map(String::as_str),
+            Some("Bahnhofstrasse")
+        );
+        assert!(
+            !lookup.address.contains_key("addr:city"),
+            "addr: prefix must be stripped"
+        );
         // BitcoinAcceptance reads these straight off extratags.
-        assert_eq!(lookup.extratags.get("currency:XBT").map(String::as_str), Some("yes"));
-        assert_eq!(lookup.extratags.get("payment:lightning").map(String::as_str), Some("yes"));
+        assert_eq!(
+            lookup.extratags.get("currency:XBT").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            lookup
+                .extratags
+                .get("payment:lightning")
+                .map(String::as_str),
+            Some("yes")
+        );
         assert!(lookup.display_name.contains("Bitcoin Cafe"));
         assert!(lookup.display_name.contains("Bern"));
     }
