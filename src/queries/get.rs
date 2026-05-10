@@ -193,16 +193,15 @@ pub fn get_place_clusters_in_viewport(
     filters: &PlaceFilters,
     limit: i64,
 ) -> Query {
-    // Cluster lat/lon = cell MIDPOINT, not centroid-of-mass. Two
-    // benefits: (1) adjacent grid cells with places near the shared
-    // edge no longer produce nearly-overlapping bubbles — clusters
-    // are exactly one `cell` apart on the grid; (2) the BTC overlay
-    // and Mapky place layers share the same midpoint formula, so a
-    // place that's both Mapky-engaged AND BTC produces aligned
-    // bubbles at the exact same lat/lon (different colors, stacked,
-    // conveying "this cell has both signals"). Centroid-based
-    // positioning drifted between layers because their per-layer
-    // sets differ.
+    // Cluster lat/lon = centroid of the cell's actual places (geo
+    // mean), not the cell midpoint. Midpoint snapping looked rigid
+    // (clusters sat on a perfect grid across the viewport) and made
+    // the BTC + Mapky cluster sets land on top of each other in
+    // every shared cell. With centroids the bubbles trace the actual
+    // density pattern of the data and rarely overlap exactly between
+    // layers; the BTC overlay layer also applies a small marker
+    // offset client-side as a safety net so even when two centroids
+    // do match, the bubbles sit side-by-side rather than stacked.
     let cypher = format!(
         "MATCH (p:Place)
          WHERE p.geocoded = true
@@ -216,11 +215,10 @@ pub fn get_place_clusters_in_viewport(
               floor(p.lon / $cell) AS lon_idx
          WITH lat_idx, lon_idx,
               count(p) AS total,
-              sum(CASE WHEN p.review_count > 0 THEN 1 ELSE 0 END) AS reviewed
-         RETURN (lat_idx + 0.5) * $cell AS lat,
-                (lon_idx + 0.5) * $cell AS lon,
-                total,
-                reviewed
+              sum(CASE WHEN p.review_count > 0 THEN 1 ELSE 0 END) AS reviewed,
+              avg(p.lat) AS lat,
+              avg(p.lon) AS lon
+         RETURN lat, lon, total, reviewed
          ORDER BY total DESC
          LIMIT $limit",
         filters = filters.cypher_clause()
@@ -303,10 +301,11 @@ pub fn get_btc_place_clusters_in_viewport(
          WITH p,
               floor(p.lat / $cell) AS lat_idx,
               floor(p.lon / $cell) AS lon_idx
-         WITH lat_idx, lon_idx, count(p) AS total
-         RETURN (lat_idx + 0.5) * $cell AS lat,
-                (lon_idx + 0.5) * $cell AS lon,
-                total
+         WITH lat_idx, lon_idx,
+              count(p) AS total,
+              avg(p.lat) AS lat,
+              avg(p.lon) AS lon
+         RETURN lat, lon, total
          ORDER BY total DESC
          LIMIT $limit",
     )
