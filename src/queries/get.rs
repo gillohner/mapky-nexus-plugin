@@ -668,6 +668,37 @@ pub fn get_geo_capture_by_id(compound_id: &str) -> Query {
     .param("id", compound_id)
 }
 
+/// Fetch every capture belonging to ANY of the given sequence URIs in
+/// a single Neo4j round-trip — replaces the per-sequence fan-out the
+/// frontend used to do when the map viewport surfaced N sequence
+/// markers (one /captures call each). Ordering is `(sequence_uri,
+/// sequence_index)` so consumers can re-group locally without a sort.
+pub fn get_captures_in_sequences(sequence_uris: Vec<String>, limit: i64) -> Query {
+    Query::new(
+        "mapky_captures_in_sequences",
+        "MATCH (u:User)-[:CAPTURED]->(g:MapkyAppGeoCapture)
+         WHERE g.sequence_uri IN $uris
+         RETURN g.id AS id,
+                u.id AS author_id,
+                g.file_uri AS file_uri,
+                g.kind AS kind,
+                g.lat AS lat, g.lon AS lon,
+                g.ele AS ele,
+                g.heading AS heading,
+                g.pitch AS pitch,
+                g.fov AS fov,
+                g.caption AS caption,
+                g.sequence_uri AS sequence_uri,
+                g.sequence_index AS sequence_index,
+                g.captured_at AS captured_at,
+                g.indexed_at AS indexed_at
+         ORDER BY g.sequence_uri ASC, g.sequence_index ASC
+         LIMIT $limit",
+    )
+    .param("uris", sequence_uris)
+    .param("limit", limit)
+}
+
 /// Fetch all captures belonging to a sequence (matched by `sequence_uri`), ordered
 /// by `sequence_index` ascending.
 pub fn get_captures_in_sequence(sequence_uri: &str, skip: i64, limit: i64) -> Query {

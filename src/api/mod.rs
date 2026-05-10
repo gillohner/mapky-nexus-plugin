@@ -83,6 +83,10 @@ pub fn routes(ctx: PluginContext) -> Router {
             "/sequences/{author_id}/{sequence_id}/captures",
             get(sequence_captures),
         )
+        .route(
+            "/sequences/captures/by_ids",
+            post(sequences_captures_by_ids),
+        )
         .route("/sequences/user/{user_id}", get(user_sequences))
         // ── Collection ──
         .route("/collections/viewport", get(collections_viewport))
@@ -141,7 +145,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         post_tags, user_posts, resource_replies,
         incidents_viewport, incident_detail, user_incidents,
         geo_captures_viewport, geo_capture_detail, geo_capture_tags, user_geo_captures, nearby_geo_captures,
-        sequence_detail, sequence_tags, sequence_captures, user_sequences,
+        sequence_detail, sequence_tags, sequence_captures, sequences_captures_by_ids, user_sequences,
         collections_viewport, collection_detail, user_collections, collections_for_place, collection_tags,
         routes_viewport, route_detail, route_tags, user_routes,
         search_tags,
@@ -157,7 +161,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         IncidentDetails, GeoCaptureDetails, SequenceDetails, CollectionDetails, RouteDetails,
         ViewportQuery, PlaceViewportQuery, MultiViewportQuery, MultiViewportResponse,
         PlaceFullQuery, PlaceFullResponse,
-        PostsQuery, PaginationQuery, NearbyQuery,
+        PostsQuery, PaginationQuery, NearbyQuery, SequenceCapturesByIdsBody,
         TagSearchQuery, TagSearchResponse,
         OsmLookupQuery, OsmSearchQuery, OsmReverseQuery, NominatimLookup,
         BitcoinPoi, BitcoinCluster, BtcViewportQuery, BtcViewportResponse, SyncStatus,
@@ -2094,6 +2098,64 @@ async fn sequence_captures(
             &sequence_uri,
             params.skip,
             params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut captures = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        captures.push(geo_capture_from_row(&row));
+    }
+    Ok(Json(captures))
+}
+
+/// Request body for `/v0/mapky/sequences/captures/by_ids`. Carries
+/// the full pubky URIs (`pubky://{author}/pub/mapky.app/sequences/{id}`)
+/// for the sequences whose member captures the caller wants in one
+/// round-trip. The frontend builds these URIs from the sequence refs
+/// it surfaces in the viewport.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SequenceCapturesByIdsBody {
+    pub uris: Vec<String>,
+    /// Total cap across ALL sequences combined. Defaults to 1000 —
+    /// roughly 50 sequences × 20 captures each, generous for any
+    /// realistic viewport.
+    #[serde(default = "default_batch_capture_limit")]
+    pub limit: i64,
+}
+
+fn default_batch_capture_limit() -> i64 {
+    1000
+}
+
+/// Batch-fetch captures across many sequences in one request.
+///
+/// Replaces the per-sequence fan-out the frontend used to do when N
+/// sequences surfaced in the viewport (one /captures call each →
+/// N round-trips). Single Neo4j query via `WHERE g.sequence_uri IN
+/// $uris`. Returns a flat list — captures already carry their own
+/// `sequence_uri`, so the caller groups locally if needed.
+#[utoipa::path(
+    post,
+    path = "/v0/mapky/sequences/captures/by_ids",
+    tag = "Sequence",
+    request_body = SequenceCapturesByIdsBody,
+    responses(
+        (status = 200, description = "Captures across the requested sequences", body = Vec<GeoCaptureDetails>),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn sequences_captures_by_ids(
+    State(_ctx): State<PluginContext>,
+    Json(body): Json<SequenceCapturesByIdsBody>,
+) -> ApiResult<Vec<GeoCaptureDetails>> {
+    if body.uris.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_captures_in_sequences(
+            body.uris, body.limit,
         ))
         .await
         .map_err(graph_err)?;
