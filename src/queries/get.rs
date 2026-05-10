@@ -1305,6 +1305,52 @@ pub fn get_sequence_by_id(compound_id: &str) -> Query {
     Query::new("mapky_get_sequence", &cypher).param("id", compound_id)
 }
 
+/// Fetch sequences whose stored bounding box overlaps the viewport.
+///
+/// Bounding-box-overlap predicate: two boxes overlap iff
+/// `aMax >= bMin AND aMin <= bMax` on both axes. We rely on the
+/// sequence's denormalized `min_lat/min_lon/max_lat/max_lon` fields
+/// (set by the indexer at sequence-create time from member captures'
+/// extremes), so the query is a single index-friendly node scan
+/// rather than a join over members.
+///
+/// Each returned sequence carries one `cover_uri` — `file_uri` from
+/// any member capture, picked by lowest `sequence_index` so the
+/// thumbnail is the start of the sequence. The frontend uses this
+/// for the marker / list cover image.
+pub fn get_sequences_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    limit: i64,
+) -> Query {
+    let cypher = format!(
+        "MATCH (u:User)-[:CAPTURED]->(s:MapkyAppSequence)
+         WHERE s.max_lat IS NOT NULL
+           AND s.max_lat >= $min_lat
+           AND s.min_lat <= $max_lat
+           AND s.max_lon >= $min_lon
+           AND s.min_lon <= $max_lon
+         WITH u, s
+         ORDER BY s.indexed_at DESC
+         LIMIT $limit
+         OPTIONAL MATCH (g:MapkyAppGeoCapture)
+           WHERE g.sequence_uri = 'pubky://' + u.id + '/pub/mapky.app/sequences/' + split(s.id, ':')[1]
+         WITH u, s, g
+         ORDER BY g.sequence_index ASC
+         WITH u, s, head(collect(g.file_uri)) AS cover_uri
+         RETURN {SEQUENCE_FIELDS},
+                cover_uri AS cover_uri"
+    );
+    Query::new("mapky_sequences_viewport", &cypher)
+        .param("min_lat", min_lat)
+        .param("min_lon", min_lon)
+        .param("max_lat", max_lat)
+        .param("max_lon", max_lon)
+        .param("limit", limit)
+}
+
 /// Fetch a user's sequences, most recent first.
 pub fn get_user_sequences(user_id: &str, skip: i64, limit: i64) -> Query {
     let cypher = format!(

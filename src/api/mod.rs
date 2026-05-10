@@ -74,6 +74,11 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/geo_captures/user/{user_id}", get(user_geo_captures))
         .route("/geo_captures/nearby", get(nearby_geo_captures))
         // ── Sequence ──
+        .route("/sequences/viewport", get(sequences_viewport))
+        .route(
+            "/sequences/{author_id}/{sequence_id}/full",
+            get(sequence_detail_full),
+        )
         .route("/sequences/{author_id}/{sequence_id}", get(sequence_detail))
         .route(
             "/sequences/{author_id}/{sequence_id}/tags",
@@ -145,7 +150,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         post_tags, user_posts, resource_replies,
         incidents_viewport, incident_detail, user_incidents,
         geo_captures_viewport, geo_capture_detail, geo_capture_tags, user_geo_captures, nearby_geo_captures,
-        sequence_detail, sequence_tags, sequence_captures, sequences_captures_by_ids, user_sequences,
+        sequence_detail, sequence_detail_full, sequence_tags, sequence_captures, sequences_captures_by_ids, sequences_viewport, user_sequences,
         collections_viewport, collection_detail, user_collections, collections_for_place, collection_tags,
         routes_viewport, route_detail, route_tags, user_routes,
         search_tags,
@@ -162,6 +167,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         ViewportQuery, PlaceViewportQuery, MultiViewportQuery, MultiViewportResponse,
         PlaceFullQuery, PlaceFullResponse,
         PostsQuery, PaginationQuery, NearbyQuery, SequenceCapturesByIdsBody,
+        SequenceViewportItem, SequenceDetailFullResponse, SequenceDetailFullQuery,
         TagSearchQuery, TagSearchResponse,
         OsmLookupQuery, OsmSearchQuery, OsmReverseQuery, NominatimLookup,
         BitcoinPoi, BitcoinCluster, BtcViewportQuery, BtcViewportResponse, SyncStatus,
@@ -2165,6 +2171,176 @@ async fn sequences_captures_by_ids(
         captures.push(geo_capture_from_row(&row));
     }
     Ok(Json(captures))
+}
+
+/// One row from the sequences-viewport query — the sequence's full
+/// metadata (everything `SequenceDetails` carries) plus a single
+/// representative `cover_uri` from any member capture (lowest
+/// `sequence_index` so the cover is the start of the sequence).
+/// Returned as a flat object instead of nesting `SequenceDetails`
+/// so JSON consumers can treat it as a regular sequence.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SequenceViewportItem {
+    #[serde(flatten)]
+    pub sequence: SequenceDetails,
+    /// `file_uri` of the lowest-index member capture, or `None` if
+    /// no member exists yet (rare — sequence published before its
+    /// first capture's event reached the watcher).
+    pub cover_uri: Option<String>,
+}
+
+/// List sequences whose stored bounding box overlaps the requested
+/// viewport. Spatial discovery surface for the map's sequence
+/// markers layer; mirrors `/v0/mapky/geo_captures/viewport` but
+/// returns sequence metadata (one item per sequence, not per
+/// member capture).
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/sequences/viewport",
+    tag = "Sequence",
+    params(
+        ("min_lat" = f64, Query, description = "Minimum latitude"),
+        ("min_lon" = f64, Query, description = "Minimum longitude"),
+        ("max_lat" = f64, Query, description = "Maximum latitude"),
+        ("max_lon" = f64, Query, description = "Maximum longitude"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "Sequences whose bbox overlaps the viewport", body = Vec<SequenceViewportItem>),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+async fn sequences_viewport(
+    State(_ctx): State<PluginContext>,
+    Query(params): Query<ViewportQuery>,
+) -> ApiResult<Vec<SequenceViewportItem>> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_sequences_in_viewport(
+            params.min_lat,
+            params.min_lon,
+            params.max_lat,
+            params.max_lon,
+            params.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut items = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        let sequence = sequence_from_row(&row);
+        let cover_uri: Option<String> = row.get("cover_uri").ok();
+        items.push(SequenceViewportItem {
+            sequence,
+            cover_uri,
+        });
+    }
+    Ok(Json(items))
+}
+
+/// Pagination knobs for the composite sequence-detail endpoint.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SequenceDetailFullQuery {
+    #[serde(default = "default_limit")]
+    pub captures_limit: i64,
+}
+
+/// Composite envelope returned by `/v0/mapky/sequences/{author}/{id}/full`.
+/// Mirrors the place-detail composite — one round-trip instead of
+/// three (detail + tags + captures).
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SequenceDetailFullResponse {
+    pub detail: SequenceDetails,
+    pub captures: Vec<GeoCaptureDetails>,
+    pub tags: Vec<PostTagDetails>,
+}
+
+/// Composite sequence-detail endpoint: detail + member captures + tags
+/// in one envelope. Sub-queries run concurrently via
+/// `tokio::try_join!` so wall-clock cost is `max(t)` rather than
+/// `sum(t)`.
+#[utoipa::path(
+    get,
+    path = "/v0/mapky/sequences/{author_id}/{sequence_id}/full",
+    tag = "Sequence",
+    params(
+        ("author_id" = String, Path, description = "Sequence author's pubky ID"),
+        ("sequence_id" = String, Path, description = "Sequence ID"),
+        ("captures_limit" = Option<i64>, Query, description = "Max member captures (default 100)"),
+    ),
+    responses(
+        (status = 200, description = "Sequence detail + members + tags", body = SequenceDetailFullResponse),
+        (status = 404, description = "Sequence not found"),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn sequence_detail_full(
+    State(_ctx): State<PluginContext>,
+    Path((author_id, sequence_id)): Path<(String, String)>,
+    Query(params): Query<SequenceDetailFullQuery>,
+) -> ApiResult<SequenceDetailFullResponse> {
+    let compound_id = format!("{author_id}:{sequence_id}");
+    let sequence_uri = format!("pubky://{author_id}/pub/mapky.app/sequences/{sequence_id}");
+
+    // Detail must be fetched first — a 404 on the detail short-
+    // circuits the other queries (no point fanning out if the
+    // sequence doesn't exist).
+    let detail = fetch_sequence_detail(&compound_id).await?;
+
+    let (captures, (_found, tags)) = tokio::try_join!(
+        fetch_captures_in_sequence(&sequence_uri, params.captures_limit),
+        async { fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await },
+    )?;
+
+    Ok(Json(SequenceDetailFullResponse {
+        detail,
+        captures,
+        tags,
+    }))
+}
+
+/// Inner helper — fetches a sequence by compound id and returns
+/// either the row or a 404. Shared between `sequence_detail` and
+/// `sequence_detail_full`.
+async fn fetch_sequence_detail(
+    compound_id: &str,
+) -> Result<SequenceDetails, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_sequence_by_id(compound_id))
+        .await
+        .map_err(graph_err)?;
+    match stream.try_next().await.map_err(graph_err)? {
+        Some(row) => Ok(sequence_from_row(&row)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("Sequence {compound_id} not found"),
+            }),
+        )),
+    }
+}
+
+/// Inner helper — fetch member captures of a sequence, ordered by
+/// `sequence_index` ascending. Shared with the composite handler.
+async fn fetch_captures_in_sequence(
+    sequence_uri: &str,
+    limit: i64,
+) -> Result<Vec<GeoCaptureDetails>, (StatusCode, Json<ApiError>)> {
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_captures_in_sequence(
+            sequence_uri,
+            0,
+            limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+    let mut captures = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        captures.push(geo_capture_from_row(&row));
+    }
+    Ok(captures)
 }
 
 /// Helper to parse a Neo4j row into `SequenceDetails` (no tags).
