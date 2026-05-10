@@ -42,11 +42,7 @@ impl IncidentDetails {
             lon: incident.lon,
             heading: incident.heading,
             description: incident.description.clone(),
-            attachments: incident
-                .attachments
-                .as_ref()
-                .cloned()
-                .unwrap_or_default(),
+            attachments: incident.attachments.as_ref().cloned().unwrap_or_default(),
             expires_at: incident.expires_at,
             indexed_at: Utc::now().timestamp_millis(),
         }

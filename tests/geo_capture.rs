@@ -2,20 +2,19 @@
 
 use anyhow::Result;
 use futures::TryStreamExt;
+use mapky_app_specs::traits::{HasIdPath, TimestampId};
 use mapky_app_specs::{GeoCaptureKind, MapkyAppGeoCapture};
 use mapky_nexus_plugin::MapkyPlugin;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::db::graph::Query;
 use nexus_watcher::testing::WatcherTest;
 use pubky::Keypair;
-use mapky_app_specs::traits::{HasIdPath, TimestampId};
 use pubky_app_specs::PubkyAppUser;
 use std::sync::Arc;
 
 #[tokio_shared_rt::test(shared)]
 async fn test_geo_capture_lifecycle() -> Result<()> {
-    let mut test =
-        WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
+    let mut test = WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
 
     let user_kp = Keypair::random();
     let user = PubkyAppUser {
@@ -42,8 +41,7 @@ async fn test_geo_capture_lifecycle() -> Result<()> {
         captured_at: Some(1_750_000_000_000_000), // mid-2025 (microseconds)
     };
     let capture_id = capture.create_id();
-    let capture_path: pubky::ResourcePath =
-        MapkyAppGeoCapture::create_path(&capture_id).parse()?;
+    let capture_path: pubky::ResourcePath = MapkyAppGeoCapture::create_path(&capture_id).parse()?;
     test.put(&user_kp, &capture_path, &capture).await?;
 
     // Verify indexed.

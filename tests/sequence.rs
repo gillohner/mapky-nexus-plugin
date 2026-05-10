@@ -23,8 +23,7 @@ use std::sync::Arc;
 
 #[tokio_shared_rt::test(shared)]
 async fn test_sequence_lifecycle_and_tagging() -> Result<()> {
-    let mut test =
-        WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
+    let mut test = WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
 
     // ── Create user ─────────────────────────────────────────────────────────
     let user_kp = Keypair::random();
@@ -43,8 +42,7 @@ async fn test_sequence_lifecycle_and_tagging() -> Result<()> {
     sequence.name = Some("Walk down Lambeth Rd".to_string());
     sequence.device = Some("iPhone 15 Pro".to_string());
     let sequence_id = sequence.create_id();
-    let sequence_path: pubky::ResourcePath =
-        MapkyAppSequence::create_path(&sequence_id).parse()?;
+    let sequence_path: pubky::ResourcePath = MapkyAppSequence::create_path(&sequence_id).parse()?;
     test.put(&user_kp, &sequence_path, &sequence).await?;
 
     let compound_seq_id = format!("{user_id}:{sequence_id}");
@@ -64,7 +62,10 @@ async fn test_sequence_lifecycle_and_tagging() -> Result<()> {
             .param("id", compound_seq_id.as_str()),
         )
         .await?;
-    let row = stream.try_next().await?.expect("Sequence node should exist");
+    let row = stream
+        .try_next()
+        .await?
+        .expect("Sequence node should exist");
     let name: String = row.get("name")?;
     let device: String = row.get("device")?;
     let t_start: i64 = row.get("t_start")?;
@@ -174,9 +175,7 @@ async fn test_sequence_lifecycle_and_tagging() -> Result<()> {
         .split_once(':')
         .map(|(_, s)| s.to_string())
         .unwrap();
-    let capture_uri = format!(
-        "pubky://{user_id}/pub/mapky.app/geo_captures/{first_capture_short}"
-    );
+    let capture_uri = format!("pubky://{user_id}/pub/mapky.app/geo_captures/{first_capture_short}");
 
     let cap_tag = PubkyAppTag {
         uri: capture_uri,

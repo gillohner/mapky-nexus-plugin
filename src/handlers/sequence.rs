@@ -23,9 +23,7 @@ pub async fn sync_put(
         .run(queries::put::create_user(user_id, details.indexed_at))
         .await?;
 
-    graph
-        .run(queries::put::create_sequence(&details))
-        .await?;
+    graph.run(queries::put::create_sequence(&details)).await?;
 
     Ok(())
 }

@@ -2,35 +2,131 @@
 
 use nexus_common::db::graph::Query;
 
-/// Filters layered on top of the bbox. Each one when `true` narrows
-/// the result to places that satisfy the predicate. All-`false` means
-/// "no narrowing" and the query returns every geocoded place in bbox.
+/// Activity dimensions a place can satisfy. Used as a multi-select OR
+/// set: a place matches the filter if it satisfies ANY of the selected
+/// activities. Replaces the old AND-of-three-booleans pattern, which
+/// hit an impossible-intersection trap whenever the user wanted "any
+/// place that has Mapky engagement" (a place with only posts, no
+/// reviews/tags, was unreachable through the old filter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlaceActivity {
+    /// `:User-[:TAGGED]->Place` exists (the place has at least one tag).
+    Tagged,
+    /// `:MapkyAppReview-[:ABOUT]->Place` exists.
+    Reviewed,
+    /// `:MapkyAppPost-[:ABOUT]->Place` exists (non-review post, comment, or media).
+    Posted,
+    /// `:MapkyAppCollection-[:CONTAINS]->Place` exists.
+    Collected,
+}
+
+impl PlaceActivity {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tagged" => Some(Self::Tagged),
+            "reviewed" => Some(Self::Reviewed),
+            "posted" => Some(Self::Posted),
+            "collected" => Some(Self::Collected),
+            _ => None,
+        }
+    }
+
+    /// Cypher predicate against the bound `p:Place` row. Tagged and
+    /// Reviewed read the denormalized counters on the Place node (cheap);
+    /// Posted and Collected probe edges via `EXISTS { ... }` (one
+    /// expand each — Neo4j short-circuits on first hit).
+    fn cypher_predicate(self) -> &'static str {
+        match self {
+            Self::Tagged => "p.tag_count > 0",
+            Self::Reviewed => "p.review_count > 0",
+            Self::Posted => "EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) }",
+            Self::Collected => "EXISTS { (:MapkyAppCollection)-[:CONTAINS]->(p) }",
+        }
+    }
+}
+
+/// Filters layered on top of the bbox.
 ///
-/// Kept as a struct (rather than positional bools) so the call sites
-/// stay readable when we add another filter dimension later.
-#[derive(Debug, Clone, Copy, Default)]
+/// `activities` — multi-select OR. Empty defaults to "any Mapky
+/// engagement" (OR of all four activities). Selecting one or more
+/// pills narrows further. This default exists because the BTCMap
+/// sync floods Neo4j with `:Place` nodes that have no Mapky data
+/// (no reviews/tags/posts/collections); without this default, every
+/// /viewport call would return every BTC merchant in the bbox and
+/// the place layer would be unfilterable. BTC merchants surface via
+/// the dedicated `/btc/viewport` overlay instead.
+///
+/// `include_unengaged` — escape hatch that bypasses the
+/// "any-Mapky-engagement" default and returns every Place node in
+/// the bbox (the old behavior). Useful for admin / "show me the raw
+/// graph" UIs; off by default.
+///
+/// `min_rating` — optional 0–10 floor (avg_rating is stored on the
+/// 0–10 scale so half-stars stay precise; the API layer multiplies a
+/// 0–5 user input by 2 before passing it through).
+#[derive(Debug, Clone, Default)]
 pub struct PlaceFilters {
-    pub bitcoin: bool,
-    pub reviewed: bool,
-    pub tagged: bool,
+    pub activities: Vec<PlaceActivity>,
+    pub include_unengaged: bool,
+    pub min_rating: Option<f64>,
 }
 
 impl PlaceFilters {
     /// Build the Cypher fragment that AND's onto the base bbox WHERE.
-    /// Empty when no filters are active so the simple case stays clean.
-    fn cypher_clause(&self) -> &'static str {
-        match (self.bitcoin, self.reviewed, self.tagged) {
-            (false, false, false) => "",
-            (true, false, false) => " AND p.accepts_bitcoin = true",
-            (false, true, false) => " AND p.review_count > 0",
-            (false, false, true) => " AND p.tag_count > 0",
-            (true, true, false) => " AND p.accepts_bitcoin = true AND p.review_count > 0",
-            (true, false, true) => " AND p.accepts_bitcoin = true AND p.tag_count > 0",
-            (false, true, true) => " AND p.review_count > 0 AND p.tag_count > 0",
-            (true, true, true) => {
-                " AND p.accepts_bitcoin = true AND p.review_count > 0 AND p.tag_count > 0"
-            }
+    /// Empty when `include_unengaged` is on AND no other filter is set
+    /// — preserves the unfiltered raw-graph fast path.
+    fn cypher_clause(&self) -> String {
+        let mut out = String::new();
+        // De-dup activities while preserving order — repeated tokens
+        // shouldn't OR the same predicate twice.
+        let mut seen = std::collections::HashSet::new();
+        let active: Vec<&PlaceActivity> = self
+            .activities
+            .iter()
+            .filter(|a| seen.insert(**a))
+            .collect();
+
+        let activity_clause: Option<String> = if !active.is_empty() {
+            // Explicit activities: narrow to those.
+            Some(
+                active
+                    .iter()
+                    .map(|a| a.cypher_predicate())
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+            )
+        } else if !self.include_unengaged {
+            // Empty + no opt-out: default to "any Mapky engagement".
+            Some(
+                [
+                    PlaceActivity::Tagged,
+                    PlaceActivity::Reviewed,
+                    PlaceActivity::Posted,
+                    PlaceActivity::Collected,
+                ]
+                .iter()
+                .map(|a| a.cypher_predicate())
+                .collect::<Vec<_>>()
+                .join(" OR "),
+            )
+        } else {
+            // include_unengaged + no explicit activities: no narrowing.
+            None
+        };
+        if let Some(or_chain) = activity_clause {
+            out.push_str(" AND (");
+            out.push_str(&or_chain);
+            out.push(')');
         }
+        if let Some(min) = self.min_rating {
+            // avg_rating stored 0–10; caller is responsible for the
+            // 0–5 → 0–10 conversion.
+            use std::fmt::Write;
+            // f64 formatting via write!/format! is locale-independent and
+            // emits a `.` decimal — safe to inline directly into Cypher.
+            let _ = write!(&mut out, " AND p.avg_rating >= {min}");
+        }
+        out
     }
 }
 
@@ -41,7 +137,7 @@ pub fn get_places_in_viewport(
     min_lon: f64,
     max_lat: f64,
     max_lon: f64,
-    filters: PlaceFilters,
+    filters: &PlaceFilters,
     limit: i64,
 ) -> Query {
     let cypher = format!(
@@ -94,9 +190,18 @@ pub fn get_place_clusters_in_viewport(
     max_lat: f64,
     max_lon: f64,
     cell: f64,
-    filters: PlaceFilters,
+    filters: &PlaceFilters,
     limit: i64,
 ) -> Query {
+    // Cluster lat/lon = centroid of the cell's actual places (geo
+    // mean), not the cell midpoint. Midpoint snapping looked rigid
+    // (clusters sat on a perfect grid across the viewport) and made
+    // the BTC + Mapky cluster sets land on top of each other in
+    // every shared cell. With centroids the bubbles trace the actual
+    // density pattern of the data and rarely overlap exactly between
+    // layers; the BTC overlay layer also applies a small marker
+    // offset client-side as a safety net so even when two centroids
+    // do match, the bubbles sit side-by-side rather than stacked.
     let cypher = format!(
         "MATCH (p:Place)
          WHERE p.geocoded = true
@@ -110,12 +215,10 @@ pub fn get_place_clusters_in_viewport(
               floor(p.lon / $cell) AS lon_idx
          WITH lat_idx, lon_idx,
               count(p) AS total,
-              sum(CASE WHEN coalesce(p.accepts_bitcoin, false) THEN 1 ELSE 0 END) AS btc,
               sum(CASE WHEN p.review_count > 0 THEN 1 ELSE 0 END) AS reviewed,
-              sum(CASE WHEN p.tag_count > 0 THEN 1 ELSE 0 END) AS tagged,
               avg(p.lat) AS lat,
               avg(p.lon) AS lon
-         RETURN lat, lon, total, btc, reviewed, tagged
+         RETURN lat, lon, total, reviewed
          ORDER BY total DESC
          LIMIT $limit",
         filters = filters.cypher_clause()
@@ -164,6 +267,53 @@ pub fn get_btc_places_in_viewport(
     .param("min_lon", min_lon)
     .param("max_lat", max_lat)
     .param("max_lon", max_lon)
+    .param("limit", limit)
+}
+
+/// Cluster BTC-accepting Place nodes into a `cell`-sized lat/lon
+/// grid. Mirrors `get_place_clusters_in_viewport` but filters on
+/// `accepts_bitcoin = true` and returns just `(lat, lon, total)` —
+/// the BTC overlay's cluster bubbles don't carry sub-counts since
+/// the overlay's only signal IS "BTC merchant".
+///
+/// Places that are both Mapky-engaged AND BTC are intentionally in
+/// both cluster sets — once here, once in `get_place_clusters_in_viewport`.
+/// The two clusters render in different colors (orange vs teal) so
+/// the overlap is visible to the user.
+pub fn get_btc_place_clusters_in_viewport(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    cell: f64,
+    limit: i64,
+) -> Query {
+    Query::new(
+        "mapky_btc_viewport_clusters",
+        "MATCH (p:Place)
+         WHERE p.accepts_bitcoin = true
+           AND p.geocoded = true
+           AND point.withinBBox(
+             p.location,
+             point({latitude: $min_lat, longitude: $min_lon}),
+             point({latitude: $max_lat, longitude: $max_lon})
+         )
+         WITH p,
+              floor(p.lat / $cell) AS lat_idx,
+              floor(p.lon / $cell) AS lon_idx
+         WITH lat_idx, lon_idx,
+              count(p) AS total,
+              avg(p.lat) AS lat,
+              avg(p.lon) AS lon
+         RETURN lat, lon, total
+         ORDER BY total DESC
+         LIMIT $limit",
+    )
+    .param("min_lat", min_lat)
+    .param("min_lon", min_lon)
+    .param("max_lat", max_lat)
+    .param("max_lon", max_lon)
+    .param("cell", cell)
     .param("limit", limit)
 }
 
@@ -516,6 +666,37 @@ pub fn get_geo_capture_by_id(compound_id: &str) -> Query {
                 g.indexed_at AS indexed_at",
     )
     .param("id", compound_id)
+}
+
+/// Fetch every capture belonging to ANY of the given sequence URIs in
+/// a single Neo4j round-trip — replaces the per-sequence fan-out the
+/// frontend used to do when the map viewport surfaced N sequence
+/// markers (one /captures call each). Ordering is `(sequence_uri,
+/// sequence_index)` so consumers can re-group locally without a sort.
+pub fn get_captures_in_sequences(sequence_uris: Vec<String>, limit: i64) -> Query {
+    Query::new(
+        "mapky_captures_in_sequences",
+        "MATCH (u:User)-[:CAPTURED]->(g:MapkyAppGeoCapture)
+         WHERE g.sequence_uri IN $uris
+         RETURN g.id AS id,
+                u.id AS author_id,
+                g.file_uri AS file_uri,
+                g.kind AS kind,
+                g.lat AS lat, g.lon AS lon,
+                g.ele AS ele,
+                g.heading AS heading,
+                g.pitch AS pitch,
+                g.fov AS fov,
+                g.caption AS caption,
+                g.sequence_uri AS sequence_uri,
+                g.sequence_index AS sequence_index,
+                g.captured_at AS captured_at,
+                g.indexed_at AS indexed_at
+         ORDER BY g.sequence_uri ASC, g.sequence_index ASC
+         LIMIT $limit",
+    )
+    .param("uris", sequence_uris)
+    .param("limit", limit)
 }
 
 /// Fetch all captures belonging to a sequence (matched by `sequence_uri`), ordered
@@ -1176,4 +1357,123 @@ pub fn get_reviews_for_place(osm_canonical: &str, skip: i64, limit: i64) -> Quer
     .param("osm_canonical", osm_canonical)
     .param("skip", skip)
     .param("limit", limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_filter_narrows_to_any_mapky_engagement() {
+        let f = PlaceFilters::default();
+        assert_eq!(
+            f.cypher_clause(),
+            " AND (p.tag_count > 0 OR p.review_count > 0 OR EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) } OR EXISTS { (:MapkyAppCollection)-[:CONTAINS]->(p) })"
+        );
+    }
+
+    #[test]
+    fn include_unengaged_emits_no_clause() {
+        let f = PlaceFilters {
+            include_unengaged: true,
+            ..Default::default()
+        };
+        assert_eq!(f.cypher_clause(), "");
+    }
+
+    #[test]
+    fn single_activity_wraps_in_parens() {
+        let f = PlaceFilters {
+            activities: vec![PlaceActivity::Tagged],
+            include_unengaged: false,
+            min_rating: None,
+        };
+        assert_eq!(f.cypher_clause(), " AND (p.tag_count > 0)");
+    }
+
+    #[test]
+    fn multiple_activities_or_chain() {
+        let f = PlaceFilters {
+            activities: vec![
+                PlaceActivity::Tagged,
+                PlaceActivity::Reviewed,
+                PlaceActivity::Posted,
+            ],
+            include_unengaged: false,
+            min_rating: None,
+        };
+        assert_eq!(
+            f.cypher_clause(),
+            " AND (p.tag_count > 0 OR p.review_count > 0 OR EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) })"
+        );
+    }
+
+    #[test]
+    fn duplicate_activities_dedup() {
+        let f = PlaceFilters {
+            activities: vec![
+                PlaceActivity::Tagged,
+                PlaceActivity::Tagged,
+                PlaceActivity::Reviewed,
+            ],
+            include_unengaged: false,
+            min_rating: None,
+        };
+        assert_eq!(
+            f.cypher_clause(),
+            " AND (p.tag_count > 0 OR p.review_count > 0)"
+        );
+    }
+
+    #[test]
+    fn min_rating_alone_pairs_with_engagement_default() {
+        // No activities + no include_unengaged → engagement OR is added.
+        // min_rating is added on top so this combines correctly.
+        let f = PlaceFilters {
+            activities: vec![],
+            include_unengaged: false,
+            min_rating: Some(7.5),
+        };
+        assert!(f.cypher_clause().starts_with(" AND ("));
+        assert!(f.cypher_clause().ends_with(" AND p.avg_rating >= 7.5"));
+    }
+
+    #[test]
+    fn min_rating_with_include_unengaged_emits_only_rating() {
+        let f = PlaceFilters {
+            activities: vec![],
+            include_unengaged: true,
+            min_rating: Some(7.5),
+        };
+        assert_eq!(f.cypher_clause(), " AND p.avg_rating >= 7.5");
+    }
+
+    #[test]
+    fn activity_and_min_rating_combine() {
+        let f = PlaceFilters {
+            activities: vec![PlaceActivity::Reviewed],
+            include_unengaged: false,
+            min_rating: Some(8.0),
+        };
+        assert_eq!(
+            f.cypher_clause(),
+            " AND (p.review_count > 0) AND p.avg_rating >= 8"
+        );
+    }
+
+    #[test]
+    fn parse_recognized_activities() {
+        assert_eq!(PlaceActivity::parse("tagged"), Some(PlaceActivity::Tagged));
+        assert_eq!(
+            PlaceActivity::parse("reviewed"),
+            Some(PlaceActivity::Reviewed)
+        );
+        assert_eq!(PlaceActivity::parse("posted"), Some(PlaceActivity::Posted));
+        assert_eq!(
+            PlaceActivity::parse("collected"),
+            Some(PlaceActivity::Collected)
+        );
+        assert_eq!(PlaceActivity::parse("nonsense"), None);
+        assert_eq!(PlaceActivity::parse(""), None);
+    }
 }

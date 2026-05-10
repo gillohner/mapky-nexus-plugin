@@ -102,7 +102,10 @@ pub fn osm_canonical_from_url(url: &str) -> String {
 pub fn parse_osm_url(url: &str) -> (String, i64) {
     let canonical = osm_canonical_from_url(url);
     let (osm_type, osm_id_str) = canonical.split_once('/').expect("validated OSM URL");
-    (osm_type.to_string(), osm_id_str.parse().expect("validated OSM ID"))
+    (
+        osm_type.to_string(),
+        osm_id_str.parse().expect("validated OSM ID"),
+    )
 }
 
 #[derive(Debug, Deserialize)]

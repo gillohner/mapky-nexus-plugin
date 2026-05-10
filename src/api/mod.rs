@@ -83,6 +83,10 @@ pub fn routes(ctx: PluginContext) -> Router {
             "/sequences/{author_id}/{sequence_id}/captures",
             get(sequence_captures),
         )
+        .route(
+            "/sequences/captures/by_ids",
+            post(sequences_captures_by_ids),
+        )
         .route("/sequences/user/{user_id}", get(user_sequences))
         // ── Collection ──
         .route("/collections/viewport", get(collections_viewport))
@@ -141,7 +145,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         post_tags, user_posts, resource_replies,
         incidents_viewport, incident_detail, user_incidents,
         geo_captures_viewport, geo_capture_detail, geo_capture_tags, user_geo_captures, nearby_geo_captures,
-        sequence_detail, sequence_tags, sequence_captures, user_sequences,
+        sequence_detail, sequence_tags, sequence_captures, sequences_captures_by_ids, user_sequences,
         collections_viewport, collection_detail, user_collections, collections_for_place, collection_tags,
         routes_viewport, route_detail, route_tags, user_routes,
         search_tags,
@@ -157,10 +161,10 @@ pub fn routes(ctx: PluginContext) -> Router {
         IncidentDetails, GeoCaptureDetails, SequenceDetails, CollectionDetails, RouteDetails,
         ViewportQuery, PlaceViewportQuery, MultiViewportQuery, MultiViewportResponse,
         PlaceFullQuery, PlaceFullResponse,
-        PostsQuery, PaginationQuery, NearbyQuery,
+        PostsQuery, PaginationQuery, NearbyQuery, SequenceCapturesByIdsBody,
         TagSearchQuery, TagSearchResponse,
         OsmLookupQuery, OsmSearchQuery, OsmReverseQuery, NominatimLookup,
-        BitcoinPoi, SyncStatus,
+        BitcoinPoi, BitcoinCluster, BtcViewportQuery, BtcViewportResponse, SyncStatus,
         PlaceCluster, ViewportResponse,
     ))
 )]
@@ -178,9 +182,29 @@ pub struct ViewportQuery {
     pub limit: i64,
 }
 
-/// Place-viewport query — adds zoom + optional filter flags so the
-/// handler can decide between cluster and individual rendering and
-/// narrow the result without a second round-trip.
+/// BTC overlay viewport query — adds zoom for the cluster/individual
+/// switch. Mirrors the place layer's `PlaceViewportQuery::zoom` so a
+/// place at the same cell across both layers gets the same cluster
+/// midpoint coordinates.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BtcViewportQuery {
+    pub min_lat: f64,
+    pub min_lon: f64,
+    pub max_lat: f64,
+    pub max_lon: f64,
+    #[serde(default = "default_viewport_zoom")]
+    pub zoom: u8,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+/// Place-viewport query — adds zoom + optional filter dimensions so
+/// the handler can decide between cluster and individual rendering
+/// and narrow the result without a second round-trip.
+///
+/// Filters:
+///   `activity` — comma-separated multi-select OR (`tagged,reviewed,posted,collected`).
+///   `min_rating` — 0.0–5.0 floor on the place's average rating.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct PlaceViewportQuery {
     pub min_lat: f64,
@@ -195,14 +219,21 @@ pub struct PlaceViewportQuery {
     pub zoom: u8,
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// Filter pills — when `true`, narrow to the matching set.
-    /// All-`false` (the default) means "show every place".
+    /// Comma-separated activity OR set. Recognized: `tagged`, `reviewed`,
+    /// `posted`, `collected`. Unknown tokens are silently ignored.
     #[serde(default)]
-    pub bitcoin: bool,
+    pub activity: Option<String>,
+    /// Minimum average rating on the user-facing 0–5 scale. Translated
+    /// to the internal 0–10 storage scale before hitting Cypher.
     #[serde(default)]
-    pub reviewed: bool,
+    pub min_rating: Option<f64>,
+    /// When true AND no explicit activities are selected, return every
+    /// Place node in the bbox (including BTCMap-synced merchants with
+    /// no Mapky engagement). Off by default — the place layer hides
+    /// unengaged BTC merchants so they only surface via the dedicated
+    /// `/btc/viewport` overlay.
     #[serde(default)]
-    pub tagged: bool,
+    pub include_unengaged: bool,
 }
 
 fn default_viewport_zoom() -> u8 {
@@ -231,13 +262,19 @@ pub struct MultiViewportQuery {
     /// drop-in replacement for `/viewport`.
     #[serde(default)]
     pub include: Option<String>,
-    /// Place filter pills — only consulted when `include` selects `places`.
+    /// Comma-separated activity OR set, only consulted when
+    /// `include` selects `places`. See `PlaceViewportQuery::activity`.
     #[serde(default)]
-    pub bitcoin: bool,
+    pub activity: Option<String>,
+    /// 0.0–5.0 minimum-rating filter, only consulted when `include`
+    /// selects `places`.
     #[serde(default)]
-    pub reviewed: bool,
+    pub min_rating: Option<f64>,
+    /// Opt-out for the place layer's "any-Mapky-engagement" default,
+    /// only consulted when `include` selects `places`. See
+    /// `PlaceViewportQuery::include_unengaged`.
     #[serde(default)]
-    pub tagged: bool,
+    pub include_unengaged: bool,
 }
 
 /// Composite-viewport response. Each field is `Some` only when the
@@ -321,6 +358,41 @@ fn parse_include(raw: Option<&str>) -> IncludeSet {
         set.places = true;
     }
     set
+}
+
+/// Parse the place-viewport filter query params into a `PlaceFilters`.
+///
+/// - `activity` is comma-separated; unknown tokens are ignored.
+/// - `min_rating` is on the user-facing 0–5 scale and gets doubled to
+///   match the 0–10 storage scale before reaching Cypher.
+/// - `include_unengaged` opts out of the "any-Mapky-engagement"
+///   default — when on AND no explicit activities are given, the
+///   query returns every Place node in the bbox (BTCMap-flooded
+///   merchants included).
+fn parse_place_filters(
+    activity: Option<&str>,
+    min_rating: Option<f64>,
+    include_unengaged: bool,
+) -> queries::get::PlaceFilters {
+    let activities = activity
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(queries::get::PlaceActivity::parse)
+                .collect()
+        })
+        .unwrap_or_default();
+    let min_rating = min_rating
+        // Out-of-range values are clamped silently; the alternative is
+        // a 400 that's unhelpful for an exploratory filter UI.
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .map(|r| (r * 2.0).clamp(0.0, 10.0));
+    queries::get::PlaceFilters {
+        activities,
+        include_unengaged,
+        min_rating,
+    }
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -422,17 +494,28 @@ fn default_reverse_zoom() -> u32 {
     18
 }
 
-/// One row from the cluster aggregation. Carries enough sub-counts
-/// for the frontend to draw a per-cluster ratio bar (BTC / reviewed /
-/// tagged) without a second query.
+/// One row from the place-cluster aggregation. `total` is the cluster's
+/// place count, `reviewed` is the sub-count of cells with at least one
+/// reviewed place — drives the cluster bubble's accent ring intensity.
+/// `lat`/`lon` are the cell midpoint (deterministic: two layers'
+/// clusters at the same cell align exactly), not the centroid.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PlaceCluster {
     pub lat: f64,
     pub lon: f64,
     pub total: i64,
-    pub btc: i64,
     pub reviewed: i64,
-    pub tagged: i64,
+}
+
+/// One row from the BTC-cluster aggregation. Same shape as
+/// `PlaceCluster` minus the reviewed sub-count — the BTC overlay's
+/// only signal IS "BTC merchant", so cluster bubbles don't carry
+/// further breakdowns.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BitcoinCluster {
+    pub lat: f64,
+    pub lon: f64,
+    pub total: i64,
 }
 
 /// Discriminated envelope for the place-viewport endpoint. The frontend
@@ -451,6 +534,26 @@ pub enum ViewportResponse {
     },
     /// `zoom >= cluster_zoom_threshold` — individual place markers.
     Places { places: Vec<PlaceDetails> },
+}
+
+/// Discriminated envelope for the BTC overlay endpoint. Mirrors
+/// `ViewportResponse` so the frontend can switch between cluster
+/// bubbles (low zoom) and individual orange dots (high zoom) off a
+/// single shape — same query key, no client-side decision about which
+/// mode the server picked.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BtcViewportResponse {
+    /// `zoom < cluster_zoom_threshold` — grid-aggregated overview.
+    Clusters {
+        clusters: Vec<BitcoinCluster>,
+        /// Cell size (degrees) used for binning. Same value as the
+        /// place layer's cell at the same zoom — clusters in the same
+        /// cell align across layers.
+        cell: f64,
+    },
+    /// `zoom >= cluster_zoom_threshold` — individual BTC POIs.
+    Places { places: Vec<BitcoinPoi> },
 }
 
 /// MapLibre zoom at or above which we switch from cluster bubbles to
@@ -596,7 +699,7 @@ async fn fetch_places_in_viewport(
     max_lon: f64,
     zoom: u8,
     limit: i64,
-    filters: queries::get::PlaceFilters,
+    filters: &queries::get::PlaceFilters,
 ) -> Result<ViewportResponse, (StatusCode, Json<ApiError>)> {
     let graph = get_neo4j_graph().map_err(graph_err)?;
 
@@ -627,9 +730,7 @@ async fn fetch_places_in_viewport(
             lat: row.get("lat").unwrap_or(0.0),
             lon: row.get("lon").unwrap_or(0.0),
             total: row.get("total").unwrap_or(0),
-            btc: row.get("btc").unwrap_or(0),
             reviewed: row.get("reviewed").unwrap_or(0),
-            tagged: row.get("tagged").unwrap_or(0),
         });
     }
     Ok(ViewportResponse::Clusters { clusters, cell })
@@ -879,9 +980,9 @@ async fn fetch_routes_near_point(
         ("max_lon" = f64, Query, description = "Maximum longitude"),
         ("zoom" = Option<u8>, Query, description = "Current MapLibre zoom (0-22). Switches to cluster mode below 13."),
         ("limit" = Option<i64>, Query, description = "Max rows (clusters or places); default 100"),
-        ("bitcoin" = Option<bool>, Query, description = "Narrow to Bitcoin-accepting places"),
-        ("reviewed" = Option<bool>, Query, description = "Narrow to places with at least one review"),
-        ("tagged" = Option<bool>, Query, description = "Narrow to places with at least one tag"),
+        ("activity" = Option<String>, Query, description = "Comma-separated activity OR set: tagged,reviewed,posted,collected"),
+        ("min_rating" = Option<f64>, Query, description = "Minimum average rating (0.0–5.0)"),
+        ("include_unengaged" = Option<bool>, Query, description = "Opt out of the 'any-Mapky-engagement' default (off by default)"),
     ),
     responses(
         (status = 200, description = "Cluster summary or individual places", body = ViewportResponse),
@@ -892,11 +993,11 @@ async fn viewport(
     State(_ctx): State<PluginContext>,
     Query(params): Query<PlaceViewportQuery>,
 ) -> ApiResult<ViewportResponse> {
-    let filters = queries::get::PlaceFilters {
-        bitcoin: params.bitcoin,
-        reviewed: params.reviewed,
-        tagged: params.tagged,
-    };
+    let filters = parse_place_filters(
+        params.activity.as_deref(),
+        params.min_rating,
+        params.include_unengaged,
+    );
     let resp = fetch_places_in_viewport(
         params.min_lat,
         params.min_lon,
@@ -904,7 +1005,7 @@ async fn viewport(
         params.max_lon,
         params.zoom,
         params.limit,
-        filters,
+        &filters,
     )
     .await?;
     Ok(Json(resp))
@@ -933,9 +1034,9 @@ async fn viewport(
         ("zoom" = Option<u8>, Query, description = "Zoom for the place layer's cluster decision (defaults to 13)"),
         ("limit" = Option<i64>, Query, description = "Max rows per layer; default 100"),
         ("include" = Option<String>, Query, description = "Comma-separated layer names: places,collections,captures,routes. Default: places."),
-        ("bitcoin" = Option<bool>, Query, description = "Place filter: BTC-accepting only"),
-        ("reviewed" = Option<bool>, Query, description = "Place filter: at least one review"),
-        ("tagged" = Option<bool>, Query, description = "Place filter: at least one tag"),
+        ("activity" = Option<String>, Query, description = "Place filter: comma-separated activity OR set (tagged,reviewed,posted,collected)"),
+        ("min_rating" = Option<f64>, Query, description = "Place filter: minimum average rating (0.0–5.0)"),
+        ("include_unengaged" = Option<bool>, Query, description = "Place filter: opt out of the 'any-Mapky-engagement' default"),
     ),
     responses(
         (status = 200, description = "Composite envelope with one branch per requested layer", body = MultiViewportResponse),
@@ -947,11 +1048,11 @@ async fn viewport_multi(
     Query(params): Query<MultiViewportQuery>,
 ) -> ApiResult<MultiViewportResponse> {
     let inc = parse_include(params.include.as_deref());
-    let filters = queries::get::PlaceFilters {
-        bitcoin: params.bitcoin,
-        reviewed: params.reviewed,
-        tagged: params.tagged,
-    };
+    let filters = parse_place_filters(
+        params.activity.as_deref(),
+        params.min_rating,
+        params.include_unengaged,
+    );
 
     // Build a future per layer. When the layer is not requested, the
     // future short-circuits to `Ok(None)` — skipped by `try_join!` at
@@ -965,7 +1066,7 @@ async fn viewport_multi(
                 params.max_lon,
                 params.zoom,
                 params.limit,
-                filters,
+                &filters,
             )
             .await
             .map(Some)
@@ -2008,6 +2109,64 @@ async fn sequence_captures(
     Ok(Json(captures))
 }
 
+/// Request body for `/v0/mapky/sequences/captures/by_ids`. Carries
+/// the full pubky URIs (`pubky://{author}/pub/mapky.app/sequences/{id}`)
+/// for the sequences whose member captures the caller wants in one
+/// round-trip. The frontend builds these URIs from the sequence refs
+/// it surfaces in the viewport.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SequenceCapturesByIdsBody {
+    pub uris: Vec<String>,
+    /// Total cap across ALL sequences combined. Defaults to 1000 —
+    /// roughly 50 sequences × 20 captures each, generous for any
+    /// realistic viewport.
+    #[serde(default = "default_batch_capture_limit")]
+    pub limit: i64,
+}
+
+fn default_batch_capture_limit() -> i64 {
+    1000
+}
+
+/// Batch-fetch captures across many sequences in one request.
+///
+/// Replaces the per-sequence fan-out the frontend used to do when N
+/// sequences surfaced in the viewport (one /captures call each →
+/// N round-trips). Single Neo4j query via `WHERE g.sequence_uri IN
+/// $uris`. Returns a flat list — captures already carry their own
+/// `sequence_uri`, so the caller groups locally if needed.
+#[utoipa::path(
+    post,
+    path = "/v0/mapky/sequences/captures/by_ids",
+    tag = "Sequence",
+    request_body = SequenceCapturesByIdsBody,
+    responses(
+        (status = 200, description = "Captures across the requested sequences", body = Vec<GeoCaptureDetails>),
+        (status = 500, description = "Internal server error", body = ApiError),
+    )
+)]
+async fn sequences_captures_by_ids(
+    State(_ctx): State<PluginContext>,
+    Json(body): Json<SequenceCapturesByIdsBody>,
+) -> ApiResult<Vec<GeoCaptureDetails>> {
+    if body.uris.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let mut stream = graph
+        .execute(queries::get::get_captures_in_sequences(
+            body.uris, body.limit,
+        ))
+        .await
+        .map_err(graph_err)?;
+
+    let mut captures = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+        captures.push(geo_capture_from_row(&row));
+    }
+    Ok(Json(captures))
+}
+
 /// Helper to parse a Neo4j row into `SequenceDetails` (no tags).
 fn sequence_from_row(row: &neo4rs::Row) -> SequenceDetails {
     SequenceDetails {
@@ -2791,11 +2950,21 @@ pub struct BitcoinPoi {
     pub lightning_contactless: bool,
 }
 
-/// List Bitcoin-accepting places within a geographic bounding box.
+/// Bitcoin-accepting places within a geographic bounding box.
+///
+/// Zoom-aware envelope: clusters at zoom < `CLUSTER_ZOOM_THRESHOLD`,
+/// individual POIs at or above. Mirrors `/v0/mapky/viewport` so the
+/// frontend can switch rendering modes off a single discriminated
+/// response — same shape, one query key.
 ///
 /// Served from `:Place` nodes flagged `accepts_bitcoin = true` by the
 /// periodic BTCMap sync (see `btcmap_sync.rs`). No upstream Overpass
 /// call on the request path — sub-100 ms for any user, any region.
+///
+/// Cluster cells share the place layer's `cluster_cell_for_zoom`
+/// formula and snap to cell midpoints, so a place that's both
+/// Mapky-engaged AND BTC produces aligned cluster bubbles in both
+/// layers (different colors at the same lat/lon).
 #[utoipa::path(
     get,
     path = "/v0/mapky/btc/viewport",
@@ -2805,18 +2974,43 @@ pub struct BitcoinPoi {
         ("min_lon" = f64, Query, description = "Minimum longitude"),
         ("max_lat" = f64, Query, description = "Maximum latitude"),
         ("max_lon" = f64, Query, description = "Maximum longitude"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 100)")
+        ("zoom" = Option<u8>, Query, description = "Current MapLibre zoom (0-22). Switches to cluster mode below 11."),
+        ("limit" = Option<i64>, Query, description = "Max rows (clusters or POIs); default 100"),
     ),
     responses(
-        (status = 200, description = "Bitcoin-accepting POIs in viewport", body = Vec<BitcoinPoi>),
+        (status = 200, description = "Cluster summary or individual BTC POIs", body = BtcViewportResponse),
         (status = 500, description = "Internal server error", body = ApiError)
     )
 )]
 async fn btc_viewport(
     State(_ctx): State<PluginContext>,
-    Query(params): Query<ViewportQuery>,
-) -> ApiResult<Vec<BitcoinPoi>> {
+    Query(params): Query<BtcViewportQuery>,
+) -> ApiResult<BtcViewportResponse> {
     let graph = get_neo4j_graph().map_err(graph_err)?;
+
+    if params.zoom < CLUSTER_ZOOM_THRESHOLD {
+        let cell = cluster_cell_for_zoom(params.zoom);
+        let mut stream = graph
+            .execute(queries::get::get_btc_place_clusters_in_viewport(
+                params.min_lat,
+                params.min_lon,
+                params.max_lat,
+                params.max_lon,
+                cell,
+                params.limit,
+            ))
+            .await
+            .map_err(graph_err)?;
+        let mut clusters = Vec::new();
+        while let Some(row) = stream.try_next().await.map_err(graph_err)? {
+            clusters.push(BitcoinCluster {
+                lat: row.get("lat").unwrap_or(0.0),
+                lon: row.get("lon").unwrap_or(0.0),
+                total: row.get("total").unwrap_or(0),
+            });
+        }
+        return Ok(Json(BtcViewportResponse::Clusters { clusters, cell }));
+    }
 
     let mut stream = graph
         .execute(queries::get::get_btc_places_in_viewport(
@@ -2843,7 +3037,7 @@ async fn btc_viewport(
         });
     }
 
-    Ok(Json(places))
+    Ok(Json(BtcViewportResponse::Places { places }))
 }
 
 /// Inspect BTCMap sync state: configured upstream URL, refresh

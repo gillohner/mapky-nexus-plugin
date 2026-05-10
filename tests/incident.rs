@@ -2,20 +2,19 @@
 
 use anyhow::Result;
 use futures::TryStreamExt;
+use mapky_app_specs::traits::{HasIdPath, TimestampId};
 use mapky_app_specs::{IncidentSeverity, IncidentType, MapkyAppIncident};
 use mapky_nexus_plugin::MapkyPlugin;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::db::graph::Query;
 use nexus_watcher::testing::WatcherTest;
 use pubky::Keypair;
-use mapky_app_specs::traits::{HasIdPath, TimestampId};
 use pubky_app_specs::PubkyAppUser;
 use std::sync::Arc;
 
 #[tokio_shared_rt::test(shared)]
 async fn test_incident_lifecycle() -> Result<()> {
-    let mut test =
-        WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
+    let mut test = WatcherTest::setup_with_plugins(vec![Arc::new(MapkyPlugin::new())]).await?;
 
     // Create user.
     let user_kp = Keypair::random();
@@ -40,8 +39,7 @@ async fn test_incident_lifecycle() -> Result<()> {
         expires_at: None,
     };
     let incident_id = incident.create_id();
-    let incident_path: pubky::ResourcePath =
-        MapkyAppIncident::create_path(&incident_id).parse()?;
+    let incident_path: pubky::ResourcePath = MapkyAppIncident::create_path(&incident_id).parse()?;
     test.put(&user_kp, &incident_path, &incident).await?;
 
     // Verify indexed in Neo4j.
