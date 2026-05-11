@@ -177,6 +177,14 @@ pub struct NominatimLookup {
     /// signals straight off this.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extratags: HashMap<String, String>,
+    /// `[south, north, west, east]` in decimal degrees. Nominatim
+    /// returns this on every result; relation-typed hits (countries,
+    /// states, cities) carry the real admin boundary, point hits
+    /// (single nodes) get a tiny synthetic box from upstream. Lets
+    /// the offline-regions UI download a real country instead of a
+    /// fixed radius around the capital.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundingbox: Option<[f64; 4]>,
 }
 
 /// Raw response shape from Nominatim. Slightly looser than the
@@ -198,6 +206,9 @@ struct NominatimRaw {
     lon: Option<String>,
     #[serde(default)]
     extratags: HashMap<String, String>,
+    /// Nominatim sends `["south", "north", "west", "east"]` as strings.
+    #[serde(default)]
+    boundingbox: Option<Vec<String>>,
 }
 
 impl NominatimRaw {
@@ -216,8 +227,21 @@ impl NominatimRaw {
             lat: self.lat.and_then(|s| s.parse().ok()),
             lon: self.lon.and_then(|s| s.parse().ok()),
             extratags: self.extratags,
+            boundingbox: parse_boundingbox(self.boundingbox.as_deref()),
         }
     }
+}
+
+fn parse_boundingbox(raw: Option<&[String]>) -> Option<[f64; 4]> {
+    let arr = raw?;
+    if arr.len() != 4 {
+        return None;
+    }
+    let parsed: Vec<f64> = arr.iter().filter_map(|s| s.parse().ok()).collect();
+    if parsed.len() != 4 {
+        return None;
+    }
+    Some([parsed[0], parsed[1], parsed[2], parsed[3]])
 }
 
 /// Stable Redis key per OSM ref.
@@ -277,6 +301,7 @@ fn empty_lookup(osm_type: &str, osm_id: i64) -> NominatimLookup {
         lat: None,
         lon: None,
         extratags: HashMap::new(),
+        boundingbox: None,
     }
 }
 
@@ -428,6 +453,9 @@ fn lookup_from_overpass(elem: OverpassElement) -> NominatimLookup {
         // Pass-through every tag — frontend reads `currency:XBT`,
         // `payment:*`, `opening_hours`, etc. straight off this map.
         extratags: elem.tags,
+        // Overpass fallback can't supply an admin boundary — leave
+        // empty so the frontend falls back to a synthetic bbox.
+        boundingbox: None,
     }
 }
 
