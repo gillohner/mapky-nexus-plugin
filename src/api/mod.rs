@@ -1467,7 +1467,12 @@ async fn resource_replies(
     Path((resource_type, author_id, resource_id)): Path<(String, String, String)>,
     Query(params): Query<PaginationQuery>,
 ) -> ApiResult<Vec<MapkyPostDetails>> {
-    let label = mapky_resource_label(&resource_type).ok_or_else(|| {
+    let compound_id = format!("{author_id}:{resource_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let label = mapky_resource_label(&graph, &resource_type, &compound_id)
+        .await
+        .map_err(graph_err)?
+        .ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(ApiError {
@@ -1475,8 +1480,6 @@ async fn resource_replies(
             }),
         )
     })?;
-    let compound_id = format!("{author_id}:{resource_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
     let mut stream = graph
         .execute(queries::get::get_replies_for_resource(
             label,

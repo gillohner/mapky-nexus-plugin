@@ -1,10 +1,21 @@
-//! Collection model — a curated list of OSM places stored as a Neo4j
-//! `:MapkyAppCollection` node with `CONTAINS` edges to `:Place` nodes.
+//! Collection model — a curated list encoded inside
+//! `PubkyAppPost(kind = Collection).content` and indexed into Neo4j as
+//! `:MapkyAppCollection` with `CONTAINS` edges to `:Place` nodes.
 
 use serde::{Deserialize, Serialize};
 
 use chrono::Utc;
-use mapky_app_specs::MapkyAppCollection;
+use mapky_app_specs::{PubkyAppCollectionContent, PubkyAppPost};
+
+#[derive(Debug, Deserialize)]
+struct MapkyCollectionEnvelope {
+    name: String,
+    description: Option<String>,
+    #[serde(default)]
+    items: Vec<String>,
+    #[serde(default)]
+    color: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CollectionDetails {
@@ -19,20 +30,35 @@ pub struct CollectionDetails {
 }
 
 impl CollectionDetails {
-    pub fn from_mapky_collection(
-        collection: &MapkyAppCollection,
+    pub fn from_collection_post(
+        post: &PubkyAppPost,
         user_id: &str,
         collection_id: &str,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        let envelope: MapkyCollectionEnvelope = serde_json::from_str(&post.content)
+            .or_else(|_| {
+                serde_json::from_str::<PubkyAppCollectionContent>(&post.content).map(|v| {
+                    MapkyCollectionEnvelope {
+                        name: v.name,
+                        description: v.description,
+                        items: v.items,
+                        color: None,
+                    }
+                })
+            })
+            .map_err(|e| format!("Invalid collection post content envelope: {e}"))?;
+
+        let name = envelope.name.trim().to_string();
+
+        Ok(Self {
             id: format!("{user_id}:{collection_id}"),
             author_id: user_id.to_string(),
-            name: collection.name.clone(),
-            description: collection.description.clone(),
-            items: collection.items.clone(),
-            image_uri: collection.image_uri.clone(),
-            color: collection.color.clone(),
+            name,
+            description: envelope.description,
+            items: envelope.items,
+            image_uri: None,
+            color: envelope.color,
             indexed_at: Utc::now().timestamp_millis(),
-        }
+        })
     }
 }

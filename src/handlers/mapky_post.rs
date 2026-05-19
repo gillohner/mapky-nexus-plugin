@@ -17,9 +17,11 @@
 
 use futures::TryStreamExt;
 use mapky_app_specs::traits::Validatable;
-use mapky_app_specs::PubkyAppPost;
+use mapky_app_specs::{PubkyAppPost, PubkyAppPostKind};
 use nexus_common::db::get_neo4j_graph;
+use nexus_common::db::graph::GraphOps;
 use nexus_common::types::DynError;
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::models::mapky_post::MapkyPostDetails;
@@ -56,8 +58,12 @@ pub async fn sync_put(data: &[u8], user_id: &str, post_id: &str) -> Result<(), D
         .run(queries::put::create_mapky_post(&post_details))
         .await?;
 
+    if matches!(post.kind, PubkyAppPostKind::Collection) {
+        crate::handlers::collection::sync_put(&post, user_id, post_id).await?;
+    }
+
     if let Some(ref parent_uri) = post_details.parent_uri {
-        match resolve_parent(parent_uri) {
+        match resolve_parent(&graph, parent_uri).await? {
             Some(ParentRef::OsmPlace { osm_url }) => {
                 let osm_canonical = osm_canonical_from_url(&osm_url);
 
@@ -113,39 +119,75 @@ pub async fn del(user_id: &str, post_id: &str) -> Result<(), DynError> {
     graph
         .run(queries::del::delete_mapky_post(user_id, &compound_id))
         .await?;
+    graph
+        .run(queries::del::delete_collection(user_id, &compound_id))
+        .await?;
 
     Ok(())
 }
 
-fn resolve_parent(parent_uri: &str) -> Option<ParentRef> {
+async fn resolve_parent(
+    graph: &Arc<dyn GraphOps>,
+    parent_uri: &str,
+) -> Result<Option<ParentRef>, DynError> {
     if parent_uri.starts_with(OSM_URL_PREFIX) {
-        return Some(ParentRef::OsmPlace {
+        return Ok(Some(ParentRef::OsmPlace {
             osm_url: parent_uri.to_string(),
-        });
+        }));
     }
 
-    let path = crate::extract_pub_path(parent_uri)?;
-    let (resource_type, resource_id) = crate::split_resource(path)?;
-    let author_id = crate::extract_user_id(parent_uri)?;
-    let label = mapky_resource_label(resource_type)?;
-    Some(ParentRef::Mapky {
+    let path = match crate::extract_pub_path(parent_uri) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let (resource_type, resource_id) = match crate::split_resource(path) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let author_id = match crate::extract_user_id(parent_uri) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let compound_id = format!("{author_id}:{resource_id}");
+    let label = mapky_resource_label(graph, resource_type, &compound_id).await?;
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    Ok(Some(ParentRef::Mapky {
         label,
-        compound_id: format!("{author_id}:{resource_id}"),
-    })
+        compound_id,
+    }))
 }
 
 /// Map a `/pub/mapky.app/{segment}/` segment to its Neo4j node label.
 /// Kept in lockstep with `handlers::tag::neo4j_label_for` so the same set of
 /// resources can be tagged AND replied to.
-pub(crate) fn mapky_resource_label(resource_type: &str) -> Option<&'static str> {
-    match resource_type {
+pub(crate) async fn mapky_resource_label(
+    graph: &Arc<dyn GraphOps>,
+    resource_type: &str,
+    compound_id: &str,
+) -> Result<Option<&'static str>, DynError> {
+    Ok(match resource_type {
         "reviews" => Some("MapkyAppReview"),
-        "posts" => Some("MapkyAppPost"),
+        "posts" => {
+            let exists: bool = graph
+                .execute(queries::get::mapky_collection_exists(compound_id))
+                .await?
+                .try_next()
+                .await?
+                .and_then(|row| row.get("exists").ok())
+                .unwrap_or(false);
+            if exists {
+                Some("MapkyAppCollection")
+            } else {
+                Some("MapkyAppPost")
+            }
+        }
         "collections" => Some("MapkyAppCollection"),
         "incidents" => Some("MapkyAppIncident"),
         "geo_captures" => Some("MapkyAppGeoCapture"),
         "routes" => Some("MapkyAppRoute"),
         "sequences" => Some("MapkyAppSequence"),
         _ => None,
-    }
+    })
 }
