@@ -537,6 +537,8 @@ fn nominatim_lookup_from_row(row: &PlaceRow) -> NominatimLookup {
         // when called with `extratags=1`. The frontend's BitcoinAcceptance
         // component reads `currency:XBT` / `payment:*` straight off this.
         extratags: row.tags.clone(),
+        // BTCMap rows have no admin boundary — point POIs only.
+        boundingbox: None,
     }
 }
 

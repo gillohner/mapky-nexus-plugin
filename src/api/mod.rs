@@ -764,8 +764,6 @@ async fn fetch_collections_in_viewport(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
@@ -938,8 +936,6 @@ async fn fetch_collections_for_place(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
@@ -1467,7 +1463,12 @@ async fn resource_replies(
     Path((resource_type, author_id, resource_id)): Path<(String, String, String)>,
     Query(params): Query<PaginationQuery>,
 ) -> ApiResult<Vec<MapkyPostDetails>> {
-    let label = mapky_resource_label(&resource_type).ok_or_else(|| {
+    let compound_id = format!("{author_id}:{resource_id}");
+    let graph = get_neo4j_graph().map_err(graph_err)?;
+    let label = mapky_resource_label(&graph, &resource_type, &compound_id)
+        .await
+        .map_err(graph_err)?
+        .ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(ApiError {
@@ -1475,8 +1476,6 @@ async fn resource_replies(
             }),
         )
     })?;
-    let compound_id = format!("{author_id}:{resource_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
     let mut stream = graph
         .execute(queries::get::get_replies_for_resource(
             label,
@@ -2399,8 +2398,6 @@ async fn collection_detail(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         })),
         None => Err((
@@ -2482,8 +2479,6 @@ async fn user_collections(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
@@ -2875,8 +2870,6 @@ async fn search_tags(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }

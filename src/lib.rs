@@ -116,9 +116,6 @@ impl NexusPlugin for MapkyPlugin {
             MapkyAppObject::Review(review) => {
                 handlers::review::sync_put(&review, user_id, resource_id).await?;
             }
-            MapkyAppObject::Collection(collection) => {
-                handlers::collection::sync_put(&collection, user_id, resource_id).await?;
-            }
             MapkyAppObject::Incident(incident) => {
                 handlers::incident::sync_put(&incident, user_id, resource_id).await?;
             }

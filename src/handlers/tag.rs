@@ -25,21 +25,6 @@ use crate::queries;
 
 const OSM_URL_PREFIX: &str = "https://www.openstreetmap.org/";
 
-/// Map a mapky resource type to its Neo4j node label.
-/// Kept in lockstep with `handlers::mapky_post::mapky_resource_label`.
-fn neo4j_label_for(resource_type: &str) -> Option<&'static str> {
-    match resource_type {
-        "reviews" => Some("MapkyAppReview"),
-        "posts" => Some("MapkyAppPost"),
-        "collections" => Some("MapkyAppCollection"),
-        "incidents" => Some("MapkyAppIncident"),
-        "geo_captures" => Some("MapkyAppGeoCapture"),
-        "routes" => Some("MapkyAppRoute"),
-        "sequences" => Some("MapkyAppSequence"),
-        _ => None,
-    }
-}
-
 pub async fn sync_put(data: &[u8], tagger_user_id: &str, tag_id: &str) -> Result<(), DynError> {
     let tag: PubkyTag = serde_json::from_slice(data)
         .map_err(|e| format!("Failed to deserialize PubkyAppTag: {e}"))?;
@@ -95,10 +80,14 @@ pub async fn sync_put(data: &[u8], tagger_user_id: &str, tag_id: &str) -> Result
         let uri_owner_id = crate::extract_user_id(&tag.uri)
             .ok_or_else(|| format!("Cannot extract user_id from tag URI: {}", tag.uri))?;
 
-        let node_label = neo4j_label_for(resource_type)
-            .ok_or_else(|| format!("Unknown mapky resource type for tagging: {resource_type}"))?;
-
         let compound_id = format!("{uri_owner_id}:{resource_id}");
+        let node_label = crate::handlers::mapky_post::mapky_resource_label(
+            &graph,
+            resource_type,
+            &compound_id,
+        )
+        .await?
+        .ok_or_else(|| format!("Unknown mapky resource type for tagging: {resource_type}"))?;
 
         // Ensure tagger user exists.
         graph

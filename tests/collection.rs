@@ -1,10 +1,10 @@
-//! Integration test: MapkyAppCollection lifecycle — create with multiple places,
+//! Integration test: collection-kind mapky post lifecycle — create with multiple places,
 //! verify CONTAINS edges, update (remove a place), verify stale edge cleanup, delete.
 
 use anyhow::Result;
 use futures::TryStreamExt;
-use mapky_app_specs::traits::{HasIdPath, TimestampId};
-use mapky_app_specs::MapkyAppCollection;
+use mapky_app_specs::traits::TimestampId;
+use mapky_app_specs::{PubkyAppCollectionContent, PubkyAppPost, PubkyAppPostKind};
 use mapky_nexus_plugin::MapkyPlugin;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::db::graph::Query;
@@ -28,19 +28,23 @@ async fn test_collection_lifecycle() -> Result<()> {
     let user_id = test.create_user(&user_kp, &user).await?;
 
     // Create a collection with 2 places.
-    let collection = MapkyAppCollection {
+    let envelope = PubkyAppCollectionContent {
         name: "Bitcoin spots".to_string(),
         description: Some("Places that accept Bitcoin".to_string()),
         items: vec![
             "https://www.openstreetmap.org/node/1573053883".to_string(),
             "https://www.openstreetmap.org/node/3646146894".to_string(),
         ],
-        image_uri: None,
-        color: None,
     };
+    let collection = PubkyAppPost::new(
+        serde_json::to_string(&envelope)?,
+        PubkyAppPostKind::Collection,
+        None,
+        None,
+        None,
+    );
     let collection_id = collection.create_id();
-    let collection_path: pubky::ResourcePath =
-        MapkyAppCollection::create_path(&collection_id).parse()?;
+    let collection_path: pubky::ResourcePath = format!("/pub/mapky.app/posts/{collection_id}").parse()?;
     test.put(&user_kp, &collection_path, &collection).await?;
 
     // Verify collection node + CONTAINS edges.
@@ -69,13 +73,18 @@ async fn test_collection_lifecycle() -> Result<()> {
     assert_eq!(place_count, 2);
 
     // Update: remove one place.
-    let updated_collection = MapkyAppCollection {
+    let updated_envelope = PubkyAppCollectionContent {
         name: "Bitcoin spots".to_string(),
         description: Some("Places that accept Bitcoin".to_string()),
         items: vec!["https://www.openstreetmap.org/node/1573053883".to_string()],
-        image_uri: None,
-        color: None,
     };
+    let updated_collection = PubkyAppPost::new(
+        serde_json::to_string(&updated_envelope)?,
+        PubkyAppPostKind::Collection,
+        None,
+        None,
+        None,
+    );
     test.put(&user_kp, &collection_path, &updated_collection)
         .await?;
 

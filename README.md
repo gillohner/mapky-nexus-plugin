@@ -50,7 +50,7 @@ All models are defined in [`mapky-app-specs`](https://github.com/gillohner/mapky
 | Model | Path | Indexed |
 |---|---|---|
 | `MapkyAppPost` | `/pub/mapky.app/posts/<id>` | Yes — nodes, edges, rating aggregates |
-| `MapkyAppCollection` | `/pub/mapky.app/collections/<id>` | Yes — node + items list |
+| `PubkyAppPost` (`kind = Collection`) | `/pub/mapky.app/posts/<id>` | Yes — projected into `:MapkyAppCollection` + items list |
 | `MapkyAppIncident` | `/pub/mapky.app/incidents/<id>` | Yes — node + spatial point |
 | `MapkyAppGeoCapture` | `/pub/mapky.app/geo_captures/<id>` | Yes — node + spatial point + heading |
 | `MapkyAppSequence` | `/pub/mapky.app/sequences/<id>` | Yes — ordered list of geo-captures |
@@ -67,7 +67,7 @@ without dedicated tag tables.
 ```
 (:User)-[:AUTHORED]->(:MapkyAppPost)-[:ABOUT]->(:Place)
 (:MapkyAppPost)-[:REPLY_TO]->(:MapkyAppPost)         // threaded replies
-(:User)-[:CREATED]->(:MapkyAppCollection)
+(:User)-[:CREATED]->(:MapkyAppCollection)            // projection of Collection-kind posts
 (:User)-[:REPORTED]->(:MapkyAppIncident)
 (:User)-[:AUTHORED]->(:MapkyAppGeoCapture)
 (:User)-[:CREATED]->(:MapkyAppRoute)

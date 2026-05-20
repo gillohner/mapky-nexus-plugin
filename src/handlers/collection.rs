@@ -1,11 +1,12 @@
-//! Collection event handler — indexes `MapkyAppCollection` into Neo4j with
-//! `(User)-[:CREATED]->(MapkyAppCollection)-[:CONTAINS]->(Place)` edges.
+//! Collection indexing helper — indexes collection-kind `PubkyAppPost`
+//! into Neo4j with `(User)-[:CREATED]->(MapkyAppCollection)-[:CONTAINS]->(Place)`
+//! edges.
 //!
 //! On update, stale CONTAINS edges (places removed from the collection)
 //! are cleaned up.
 
 use futures::TryStreamExt;
-use mapky_app_specs::MapkyAppCollection;
+use mapky_app_specs::PubkyAppPost;
 use nexus_common::db::get_neo4j_graph;
 use nexus_common::types::DynError;
 use tracing::debug;
@@ -15,13 +16,13 @@ use crate::models::place::{osm_canonical_from_url, PlaceDetails};
 use crate::queries;
 
 pub async fn sync_put(
-    collection: &MapkyAppCollection,
+    post: &PubkyAppPost,
     user_id: &str,
     collection_id: &str,
 ) -> Result<(), DynError> {
     debug!("Indexing collection {user_id}:{collection_id}");
 
-    let details = CollectionDetails::from_mapky_collection(collection, user_id, collection_id);
+    let details = CollectionDetails::from_collection_post(post, user_id, collection_id)?;
     let graph = get_neo4j_graph()?;
 
     // 1. Ensure user exists.
@@ -33,9 +34,9 @@ pub async fn sync_put(
     graph.run(queries::put::create_collection(&details)).await?;
 
     // 3. Ensure each Place exists and create CONTAINS edges.
-    let mut current_canonicals: Vec<String> = Vec::with_capacity(collection.items.len());
+    let mut current_canonicals: Vec<String> = Vec::with_capacity(details.items.len());
 
-    for osm_url in &collection.items {
+    for osm_url in &details.items {
         let osm_canonical = osm_canonical_from_url(osm_url);
 
         // Check if Place exists, geocode if new.

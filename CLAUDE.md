@@ -10,7 +10,7 @@ src/
 ├── api/mod.rs          — Axum router + handlers + OpenAPI docs
 ├── handlers/
 │   ├── post.rs         — PUT/DEL for MapkyAppPost (rating roll-up)
-│   ├── collection.rs   — PUT/DEL for MapkyAppCollection
+│   ├── collection.rs   — projection for `PubkyAppPost(kind=Collection)`
 │   ├── incident.rs     — PUT/DEL for MapkyAppIncident
 │   ├── geo_capture.rs  — PUT/DEL for MapkyAppGeoCapture
 │   ├── sequence.rs     — PUT/DEL for MapkyAppSequence
@@ -32,7 +32,7 @@ src/
 ## Dependencies
 
 - `nexus-common` — `NexusPlugin` trait, `get_neo4j_graph()`, `get_redis_conn()`
-- `mapky-app-specs` — `MapkyAppPost`, `MapkyAppRoute`, `MapkyAppCollection`, `MapkyAppIncident`, `MapkyAppGeoCapture`, `MapkyAppSequence`
+- `mapky-app-specs` — `PubkyAppPost` (+ collection envelope), `MapkyAppRoute`, `MapkyAppIncident`, `MapkyAppGeoCapture`, `MapkyAppSequence`
 - `nexus-watcher` (dev) — testing harness with `WatcherTest::setup_with_plugins()`
 
 ## Event Handling
@@ -42,7 +42,7 @@ All MapkyAppObject variants are dispatched via `MapkyAppObject::from_path()`:
 | Resource | Handler | Indexed |
 |---|---|---|
 | `posts/<id>` | `handlers::post` | `(User)-[:AUTHORED]->(MapkyAppPost)-[:ABOUT]->(Place)`; rating roll-up; `[:REPLY_TO]` for threaded replies |
-| `collections/<id>` | `handlers::collection` | `(User)-[:CREATED]->(MapkyAppCollection)`; OSM URL items |
+| `posts/<id>` with `kind=Collection` | `handlers::collection` via `handlers::mapky_post` | `(User)-[:CREATED]->(MapkyAppCollection)`; OSM URL items |
 | `incidents/<id>` | `handlers::incident` | `(User)-[:REPORTED]->(MapkyAppIncident)`; spatial point |
 | `geo_captures/<id>` | `handlers::geo_capture` | `(User)-[:AUTHORED]->(MapkyAppGeoCapture)`; spatial point + heading |
 | `sequences/<id>` | `handlers::sequence` | Capture sequence (ordered list) |
