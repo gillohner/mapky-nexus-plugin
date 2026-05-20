@@ -764,8 +764,6 @@ async fn fetch_collections_in_viewport(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
@@ -938,8 +936,6 @@ async fn fetch_collections_for_place(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
@@ -2402,8 +2398,6 @@ async fn collection_detail(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         })),
         None => Err((
@@ -2485,8 +2479,6 @@ async fn user_collections(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }
@@ -2878,8 +2870,6 @@ async fn search_tags(
             name: row.get("name").unwrap_or_default(),
             description: row.get("description").ok(),
             items: row.get::<Vec<String>>("items").unwrap_or_default(),
-            image_uri: row.get("image_uri").ok(),
-            color: row.get("color").ok(),
             indexed_at: row.get("indexed_at").unwrap_or(0),
         });
     }

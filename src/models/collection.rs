@@ -13,8 +13,6 @@ struct MapkyCollectionEnvelope {
     description: Option<String>,
     #[serde(default)]
     items: Vec<String>,
-    #[serde(default)]
-    color: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -24,8 +22,6 @@ pub struct CollectionDetails {
     pub name: String,
     pub description: Option<String>,
     pub items: Vec<String>, // OSM URLs from the spec
-    pub image_uri: Option<String>,
-    pub color: Option<String>,
     pub indexed_at: i64,
 }
 
@@ -42,7 +38,6 @@ impl CollectionDetails {
                         name: v.name,
                         description: v.description,
                         items: v.items,
-                        color: None,
                     }
                 })
             })
@@ -56,8 +51,6 @@ impl CollectionDetails {
             name,
             description: envelope.description,
             items: envelope.items,
-            image_uri: None,
-            color: envelope.color,
             indexed_at: Utc::now().timestamp_millis(),
         })
     }
