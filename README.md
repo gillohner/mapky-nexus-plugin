@@ -9,19 +9,17 @@ Neo4j graph, exposing a REST API for place reviews, posts, and spatial queries.
 
 ## Installation
 
-This crate is **not on crates.io** — the plugin system in `nexus-common` lives
-on a local pubky-nexus fork that hasn't shipped upstream yet, so a published
-copy would be unbuildable. Until upstream catches up, depend on this repo by
-git tag:
+This crate is **not on crates.io**. Deployment workspaces consume it by git ref
+alongside pinned `pubky-nexus` and `mapky-app-specs` refs:
 
 ```toml
 [dependencies]
 mapky-nexus-plugin = { git = "https://github.com/gillohner/mapky-nexus-plugin", tag = "v0.1.0-alpha.1" }
 ```
 
-You also need a sibling checkout of `gillohner/pubky-nexus` (with the
-plugin-system branch) at `../pubky-nexus/` for the path dep on `nexus-common`
-to resolve.
+The plugin is registered by a deployment-specific runner binary and can be
+enabled at runtime with `NEXUS_ENABLED_PLUGINS=mapky` when that runner compiles
+Mapky support in.
 
 ## Overview
 
@@ -187,15 +185,12 @@ curl 'localhost:8080/v0/mapky/routes/viewport?min_lat=46.7&min_lon=6.1&max_lat=4
 
 ## Running with Nexus
 
-This plugin is compiled into `nexusd` via the `mapky` feature flag. Without it,
-`nexusd` builds normally with no MapKy dependency.
+This plugin is compiled into a deployment-specific runner binary that calls
+`DaemonLauncher::start_with_plugins`. Core `pubky-nexus` stays generic and does
+not depend on Mapky directly.
 
 ```bash
-# From the pubky-nexus repo root, with this plugin next to it:
-# pubky-nexus/
-# mapky/mapky-nexus-plugin/   ← expected relative path
-
-cargo run -p nexusd --features mapky
+NEXUS_ENABLED_PLUGINS=mapky cargo run --bin nexusd-shared
 ```
 
 The plugin setup is idempotent — Neo4j constraints and spatial indexes are

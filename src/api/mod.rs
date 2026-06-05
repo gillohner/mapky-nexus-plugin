@@ -1469,13 +1469,13 @@ async fn resource_replies(
         .await
         .map_err(graph_err)?
         .ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiError {
-                error: format!("Unknown resource_type: {resource_type}"),
-            }),
-        )
-    })?;
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("Unknown resource_type: {resource_type}"),
+                }),
+            )
+        })?;
     let mut stream = graph
         .execute(queries::get::get_replies_for_resource(
             label,

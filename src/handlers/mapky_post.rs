@@ -153,10 +153,7 @@ async fn resolve_parent(
     let Some(label) = label else {
         return Ok(None);
     };
-    Ok(Some(ParentRef::Mapky {
-        label,
-        compound_id,
-    }))
+    Ok(Some(ParentRef::Mapky { label, compound_id }))
 }
 
 /// Map a `/pub/mapky.app/{segment}/` segment to its Neo4j node label.
