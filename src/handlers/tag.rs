@@ -81,13 +81,12 @@ pub async fn sync_put(data: &[u8], tagger_user_id: &str, tag_id: &str) -> Result
             .ok_or_else(|| format!("Cannot extract user_id from tag URI: {}", tag.uri))?;
 
         let compound_id = format!("{uri_owner_id}:{resource_id}");
-        let node_label = crate::handlers::mapky_post::mapky_resource_label(
-            &graph,
-            resource_type,
-            &compound_id,
-        )
-        .await?
-        .ok_or_else(|| format!("Unknown mapky resource type for tagging: {resource_type}"))?;
+        let node_label =
+            crate::handlers::mapky_post::mapky_resource_label(&graph, resource_type, &compound_id)
+                .await?
+                .ok_or_else(|| {
+                    format!("Unknown mapky resource type for tagging: {resource_type}")
+                })?;
 
         // Ensure tagger user exists.
         graph

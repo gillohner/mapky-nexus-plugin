@@ -31,6 +31,7 @@ async fn test_collection_lifecycle() -> Result<()> {
     let envelope = PubkyAppCollectionContent {
         name: "Bitcoin spots".to_string(),
         description: Some("Places that accept Bitcoin".to_string()),
+        cover_image: None,
         items: vec![
             "https://www.openstreetmap.org/node/1573053883".to_string(),
             "https://www.openstreetmap.org/node/3646146894".to_string(),
@@ -44,7 +45,8 @@ async fn test_collection_lifecycle() -> Result<()> {
         None,
     );
     let collection_id = collection.create_id();
-    let collection_path: pubky::ResourcePath = format!("/pub/mapky.app/posts/{collection_id}").parse()?;
+    let collection_path: pubky::ResourcePath =
+        format!("/pub/mapky.app/posts/{collection_id}").parse()?;
     test.put(&user_kp, &collection_path, &collection).await?;
 
     // Verify collection node + CONTAINS edges.
@@ -76,6 +78,7 @@ async fn test_collection_lifecycle() -> Result<()> {
     let updated_envelope = PubkyAppCollectionContent {
         name: "Bitcoin spots".to_string(),
         description: Some("Places that accept Bitcoin".to_string()),
+        cover_image: None,
         items: vec!["https://www.openstreetmap.org/node/1573053883".to_string()],
     };
     let updated_collection = PubkyAppPost::new(

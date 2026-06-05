@@ -544,6 +544,57 @@ fn nominatim_lookup_from_row(row: &PlaceRow) -> NominatimLookup {
 
 // ── Bolt conversion ─────────────────────────────────────────────────────
 
+/// Build a `BoltType::List` of `BoltType::Map` from a slice of rows.
+/// Lives here (not in `queries/put.rs`) so the query module stays
+/// Cypher-only and the sync module owns its own data shape.
+fn chunk_to_bolt_list(rows: &[PlaceRow]) -> BoltType {
+    let mut list = BoltList::default();
+    for row in rows {
+        let mut map = BoltMap::default();
+        map.put(
+            BoltString::from("osm_canonical"),
+            BoltType::String(BoltString::from(row.osm_canonical.as_str())),
+        );
+        map.put(
+            BoltString::from("osm_type"),
+            BoltType::String(BoltString::from(row.osm_type.as_str())),
+        );
+        map.put(
+            BoltString::from("osm_id"),
+            BoltType::Integer(BoltInteger::new(row.osm_id)),
+        );
+        map.put(
+            BoltString::from("lat"),
+            BoltType::Float(BoltFloat::new(row.lat)),
+        );
+        map.put(
+            BoltString::from("lon"),
+            BoltType::Float(BoltFloat::new(row.lon)),
+        );
+        map.put(
+            BoltString::from("name"),
+            match &row.name {
+                Some(n) => BoltType::String(BoltString::from(n.as_str())),
+                None => BoltType::Null(BoltNull),
+            },
+        );
+        map.put(
+            BoltString::from("btc_onchain"),
+            BoltType::Boolean(BoltBoolean::new(row.btc_onchain)),
+        );
+        map.put(
+            BoltString::from("btc_lightning"),
+            BoltType::Boolean(BoltBoolean::new(row.btc_lightning)),
+        );
+        map.put(
+            BoltString::from("btc_lightning_contactless"),
+            BoltType::Boolean(BoltBoolean::new(row.btc_lightning_contactless)),
+        );
+        list.push(BoltType::Map(map));
+    }
+    BoltType::List(list)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,55 +748,4 @@ mod tests {
         let el: BtcMapElement = serde_json::from_value(raw).unwrap();
         assert!(PlaceRow::from_element(el).is_none());
     }
-}
-
-/// Build a `BoltType::List` of `BoltType::Map` from a slice of rows.
-/// Lives here (not in `queries/put.rs`) so the query module stays
-/// Cypher-only and the sync module owns its own data shape.
-fn chunk_to_bolt_list(rows: &[PlaceRow]) -> BoltType {
-    let mut list = BoltList::default();
-    for row in rows {
-        let mut map = BoltMap::default();
-        map.put(
-            BoltString::from("osm_canonical"),
-            BoltType::String(BoltString::from(row.osm_canonical.as_str())),
-        );
-        map.put(
-            BoltString::from("osm_type"),
-            BoltType::String(BoltString::from(row.osm_type.as_str())),
-        );
-        map.put(
-            BoltString::from("osm_id"),
-            BoltType::Integer(BoltInteger::new(row.osm_id)),
-        );
-        map.put(
-            BoltString::from("lat"),
-            BoltType::Float(BoltFloat::new(row.lat)),
-        );
-        map.put(
-            BoltString::from("lon"),
-            BoltType::Float(BoltFloat::new(row.lon)),
-        );
-        map.put(
-            BoltString::from("name"),
-            match &row.name {
-                Some(n) => BoltType::String(BoltString::from(n.as_str())),
-                None => BoltType::Null(BoltNull),
-            },
-        );
-        map.put(
-            BoltString::from("btc_onchain"),
-            BoltType::Boolean(BoltBoolean::new(row.btc_onchain)),
-        );
-        map.put(
-            BoltString::from("btc_lightning"),
-            BoltType::Boolean(BoltBoolean::new(row.btc_lightning)),
-        );
-        map.put(
-            BoltString::from("btc_lightning_contactless"),
-            BoltType::Boolean(BoltBoolean::new(row.btc_lightning_contactless)),
-        );
-        list.push(BoltType::Map(map));
-    }
-    BoltType::List(list)
 }
