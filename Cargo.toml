@@ -11,7 +11,7 @@ keywords = ["pubky", "nexus", "mapky", "openstreetmap", "neo4j"]
 categories = ["database", "web-programming"]
 
 [dependencies]
-nexus-common = { git = "https://github.com/gillohner/pubky-nexus.git", rev = "d91e8ff9b4d9cb929b113178d9617ebc0f3afa6f" }
+nexus-common = { git = "https://github.com/gillohner/pubky-nexus.git", branch = "fix/universal-mapky-tags" }
 mapky-app-specs = { git = "https://github.com/gillohner/mapky-app-specs.git", rev = "943e097fddce411e69a1dee054574a5537ca1469" }
 async-trait = "0.1.89"
 axum = "0.8.8"
@@ -32,7 +32,7 @@ utoipa = { version = "5.4.0", features = ["axum_extras"] }
 [dev-dependencies]
 anyhow = "1.0"
 futures = "0.3"
-nexus-watcher = { git = "https://github.com/gillohner/pubky-nexus.git", rev = "d91e8ff9b4d9cb929b113178d9617ebc0f3afa6f", features = ["testing"] }
+nexus-watcher = { git = "https://github.com/gillohner/pubky-nexus.git", branch = "fix/universal-mapky-tags", features = ["testing"] }
 pubky = "0.8.0"
 pubky-app-specs = { version = "0.5.2", features = ["openapi"] }
 tokio = { version = "1.50.0", features = ["full"] }

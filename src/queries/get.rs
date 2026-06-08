@@ -31,13 +31,13 @@ impl PlaceActivity {
         }
     }
 
-    /// Cypher predicate against the bound `p:Place` row. Tagged and
-    /// Reviewed read the denormalized counters on the Place node (cheap);
-    /// Posted and Collected probe edges via `EXISTS { ... }` (one
-    /// expand each — Neo4j short-circuits on first hit).
+    /// Cypher predicate against the bound `p:Place` row. Tagged reads the
+    /// universal Resource tag graph keyed by the canonical OSM URL; Reviewed
+    /// reads the denormalized counter on Place; Posted and Collected probe
+    /// edges via `EXISTS { ... }`.
     fn cypher_predicate(self) -> &'static str {
         match self {
-            Self::Tagged => "p.tag_count > 0",
+            Self::Tagged => "EXISTS { (:User)-[:TAGGED]->(:Resource {uri: 'https://www.openstreetmap.org/' + p.osm_canonical}) }",
             Self::Reviewed => "p.review_count > 0",
             Self::Posted => "EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) }",
             Self::Collected => "EXISTS { (:MapkyAppCollection)-[:CONTAINS]->(p) }",
@@ -148,6 +148,8 @@ pub fn get_places_in_viewport(
              point({{latitude: $min_lat, longitude: $min_lon}}),
              point({{latitude: $max_lat, longitude: $max_lon}})
          ){filters}
+         OPTIONAL MATCH (:User)-[tag:TAGGED]->(:Resource {{uri: 'https://www.openstreetmap.org/' + p.osm_canonical}})
+         WITH p, count(tag) AS tag_count
          RETURN p.osm_canonical AS osm_canonical,
                 p.osm_type AS osm_type,
                 p.osm_id AS osm_id,
@@ -156,7 +158,7 @@ pub fn get_places_in_viewport(
                 p.geocoded AS geocoded,
                 p.review_count AS review_count,
                 p.avg_rating AS avg_rating,
-                p.tag_count AS tag_count,
+                tag_count,
                 p.photo_count AS photo_count,
                 p.indexed_at AS indexed_at,
                 p.name AS name,
@@ -322,6 +324,8 @@ pub fn get_place_by_canonical(osm_canonical: &str) -> Query {
     Query::new(
         "mapky_get_place",
         "MATCH (p:Place {osm_canonical: $osm_canonical})
+         OPTIONAL MATCH (:User)-[tag:TAGGED]->(:Resource {uri: 'https://www.openstreetmap.org/' + p.osm_canonical})
+         WITH p, count(tag) AS tag_count
          RETURN p.osm_canonical AS osm_canonical,
                 p.osm_type AS osm_type,
                 p.osm_id AS osm_id,
@@ -330,7 +334,7 @@ pub fn get_place_by_canonical(osm_canonical: &str) -> Query {
                 p.geocoded AS geocoded,
                 p.review_count AS review_count,
                 p.avg_rating AS avg_rating,
-                p.tag_count AS tag_count,
+                tag_count,
                 p.photo_count AS photo_count,
                 p.indexed_at AS indexed_at,
                 p.name AS name,
@@ -1076,11 +1080,15 @@ pub fn get_routes_near_point(lat: f64, lon: f64, limit: i64) -> Query {
 pub fn search_places_by_tag(query_str: &str, limit: i64) -> Query {
     Query::new(
         "mapky_search_places_by_tag",
-        "MATCH (tagger:User)-[t:TAGGED]->(p:Place)
+        "MATCH (tagger:User)-[t:TAGGED]->(r:Resource)
          WHERE t.label CONTAINS $query
-         WITH p, count(DISTINCT tagger) AS tagger_count
+           AND r.uri STARTS WITH 'https://www.openstreetmap.org/'
+         WITH r, count(DISTINCT tagger) AS tagger_count
          ORDER BY tagger_count DESC
          LIMIT $limit
+         MATCH (p:Place {osm_canonical: substring(r.uri, size('https://www.openstreetmap.org/'))})
+         OPTIONAL MATCH (:User)-[tag:TAGGED]->(r)
+         WITH p, count(tag) AS tag_count
          RETURN p.osm_canonical AS osm_canonical,
                 p.osm_type AS osm_type,
                 p.osm_id AS osm_id,
@@ -1089,7 +1097,7 @@ pub fn search_places_by_tag(query_str: &str, limit: i64) -> Query {
                 p.geocoded AS geocoded,
                 p.review_count AS review_count,
                 p.avg_rating AS avg_rating,
-                p.tag_count AS tag_count,
+                tag_count,
                 p.photo_count AS photo_count,
                 p.indexed_at AS indexed_at,
                 p.name AS name,
@@ -1401,12 +1409,14 @@ pub fn get_reviews_for_place(osm_canonical: &str, skip: i64, limit: i64) -> Quer
 mod tests {
     use super::*;
 
+    const TAGGED_PREDICATE: &str = "EXISTS { (:User)-[:TAGGED]->(:Resource {uri: 'https://www.openstreetmap.org/' + p.osm_canonical}) }";
+
     #[test]
     fn default_filter_narrows_to_any_mapky_engagement() {
         let f = PlaceFilters::default();
         assert_eq!(
             f.cypher_clause(),
-            " AND (p.tag_count > 0 OR p.review_count > 0 OR EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) } OR EXISTS { (:MapkyAppCollection)-[:CONTAINS]->(p) })"
+            format!(" AND ({TAGGED_PREDICATE} OR p.review_count > 0 OR EXISTS {{ (post:MapkyAppPost)-[:ABOUT]->(p) }} OR EXISTS {{ (:MapkyAppCollection)-[:CONTAINS]->(p) }})")
         );
     }
 
@@ -1426,7 +1436,7 @@ mod tests {
             include_unengaged: false,
             min_rating: None,
         };
-        assert_eq!(f.cypher_clause(), " AND (p.tag_count > 0)");
+        assert_eq!(f.cypher_clause(), format!(" AND ({TAGGED_PREDICATE})"));
     }
 
     #[test]
@@ -1442,7 +1452,7 @@ mod tests {
         };
         assert_eq!(
             f.cypher_clause(),
-            " AND (p.tag_count > 0 OR p.review_count > 0 OR EXISTS { (post:MapkyAppPost)-[:ABOUT]->(p) })"
+            format!(" AND ({TAGGED_PREDICATE} OR p.review_count > 0 OR EXISTS {{ (post:MapkyAppPost)-[:ABOUT]->(p) }})")
         );
     }
 
@@ -1459,7 +1469,7 @@ mod tests {
         };
         assert_eq!(
             f.cypher_clause(),
-            " AND (p.tag_count > 0 OR p.review_count > 0)"
+            format!(" AND ({TAGGED_PREDICATE} OR p.review_count > 0)")
         );
     }
 
