@@ -9,6 +9,10 @@ use axum::{
 };
 use futures::TryStreamExt;
 use nexus_common::db::get_neo4j_graph;
+use nexus_common::models::resource::tag::TagResource;
+use nexus_common::models::resource::{normalize_uri, resource_id};
+use nexus_common::models::tag::traits::TagCollection;
+use nexus_common::models::tag::TagDetails;
 use nexus_common::plugin::PluginContext;
 use serde::{Deserialize, Serialize};
 use utoipa::OpenApi;
@@ -603,6 +607,57 @@ fn graph_err(e: impl ToString) -> (StatusCode, Json<ApiError>) {
     )
 }
 
+fn osm_resource_uri(osm_canonical: &str) -> String {
+    format!("https://www.openstreetmap.org/{osm_canonical}")
+}
+
+fn mapky_resource_uri(author_id: &str, resource_type: &str, resource_id: &str) -> String {
+    format!("pubky://{author_id}/pub/mapky.app/{resource_type}/{resource_id}")
+}
+
+fn post_tags_from_universal(tags: Vec<TagDetails>) -> Vec<PostTagDetails> {
+    tags.into_iter()
+        .map(|tag| PostTagDetails {
+            label: tag.label,
+            taggers: tag.taggers,
+            taggers_count: tag.taggers_count,
+        })
+        .collect()
+}
+
+async fn fetch_universal_tags_for_uri(
+    uri: &str,
+) -> Result<Vec<PostTagDetails>, (StatusCode, Json<ApiError>)> {
+    let (normalized, _) =
+        normalize_uri(uri).map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiError { error: e })))?;
+    let resource_id = resource_id(&normalized);
+
+    let tags = TagResource::get_by_id(&resource_id, None, None, None, None, None, None)
+        .await
+        .map_err(graph_err)?
+        .unwrap_or_default();
+
+    Ok(post_tags_from_universal(tags))
+}
+
+async fn fetch_universal_tags_for_existing_target(
+    exists_query: nexus_common::db::graph::Query,
+    uri: &str,
+    not_found_error: String,
+) -> Result<Vec<PostTagDetails>, (StatusCode, Json<ApiError>)> {
+    let (found, _) = fetch_tags(exists_query).await?;
+    if !found {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: not_found_error,
+            }),
+        ));
+    }
+
+    fetch_universal_tags_for_uri(uri).await
+}
+
 /// Read a `:Place` row produced by any of the Place-returning queries
 /// (viewport, get-by-id, search). All such queries share the same
 /// projection — defined in `queries::get` and kept in sync with the
@@ -859,38 +914,13 @@ async fn fetch_mapky_posts_for_place(
 async fn fetch_tags_for_place(
     osm_canonical: &str,
 ) -> Result<(bool, Vec<PostTagDetails>), (StatusCode, Json<ApiError>)> {
-    use std::collections::HashMap;
-
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_tags_for_place(osm_canonical))
-        .await
-        .map_err(graph_err)?;
-
-    let mut found = false;
-    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        found = true;
-        let label: Option<String> = row.get("label").ok();
-        let tagger_id: Option<String> = row.get("tagger_id").ok();
-        if let (Some(l), Some(t)) = (label, tagger_id) {
-            tag_map.entry(l).or_default().push(t);
-        }
+    let (found, _) = fetch_tags(queries::get::get_tags_for_place(osm_canonical)).await?;
+    if !found {
+        return Ok((false, Vec::new()));
     }
 
-    let tags: Vec<PostTagDetails> = tag_map
-        .into_iter()
-        .map(|(label, taggers)| {
-            let taggers_count = taggers.len();
-            PostTagDetails {
-                label,
-                taggers,
-                taggers_count,
-            }
-        })
-        .collect();
-
-    Ok((found, tags))
+    let tags = fetch_universal_tags_for_uri(&osm_resource_uri(osm_canonical)).await?;
+    Ok((true, tags))
 }
 
 async fn fetch_collections_for_place(
@@ -1242,53 +1272,18 @@ fn review_from_row(row: &neo4rs::Row) -> ReviewDetails {
     }
 }
 
-/// Aggregate `(label, tagger_id)` rows into deduplicated `PostTagDetails`.
+/// Fetch universal tags for an existing MapKy resource.
 async fn collect_resource_tags(
     node_label: &str,
     compound_id: &str,
+    uri: &str,
 ) -> Result<Vec<PostTagDetails>, (StatusCode, Json<ApiError>)> {
-    use std::collections::HashMap;
-
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_tags_for_mapky_resource(
-            node_label,
-            compound_id,
-        ))
-        .await
-        .map_err(graph_err)?;
-
-    let mut found = false;
-    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        found = true;
-        let label: Option<String> = row.get("label").ok();
-        let tagger_id: Option<String> = row.get("tagger_id").ok();
-        if let (Some(l), Some(t)) = (label, tagger_id) {
-            tag_map.entry(l).or_default().push(t);
-        }
-    }
-
-    if !found {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("{node_label} {compound_id} not found"),
-            }),
-        ));
-    }
-
-    Ok(tag_map
-        .into_iter()
-        .map(|(label, taggers)| {
-            let taggers_count = taggers.len();
-            PostTagDetails {
-                label,
-                taggers,
-                taggers_count,
-            }
-        })
-        .collect())
+    fetch_universal_tags_for_existing_target(
+        queries::get::get_tags_for_mapky_resource(node_label, compound_id),
+        uri,
+        format!("{node_label} {compound_id} not found"),
+    )
+    .await
 }
 
 /// Tags on a cross-namespace MapkyAppPost (`/pub/mapky.app/posts/{id}`)
@@ -1311,7 +1306,8 @@ async fn post_tags(
     Path((author_id, post_id)): Path<(String, String)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
     let compound_id = format!("{author_id}:{post_id}");
-    let tags = collect_resource_tags("MapkyAppPost", &compound_id).await?;
+    let uri = mapky_resource_uri(&author_id, "posts", &post_id);
+    let tags = collect_resource_tags("MapkyAppPost", &compound_id, &uri).await?;
     Ok(Json(tags))
 }
 
@@ -1335,7 +1331,8 @@ async fn review_tags(
     Path((author_id, review_id)): Path<(String, String)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
     let compound_id = format!("{author_id}:{review_id}");
-    let tags = collect_resource_tags("MapkyAppReview", &compound_id).await?;
+    let uri = mapky_resource_uri(&author_id, "reviews", &review_id);
+    let tags = collect_resource_tags("MapkyAppReview", &compound_id, &uri).await?;
     Ok(Json(tags))
 }
 
@@ -1849,15 +1846,13 @@ async fn geo_capture_tags(
     Path((author_id, capture_id)): Path<(String, String)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
     let compound_id = format!("{author_id}:{capture_id}");
-    let (found, tags) = fetch_tags(queries::get::get_tags_for_geo_capture(&compound_id)).await?;
-    if !found {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("GeoCapture {compound_id} not found"),
-            }),
-        ));
-    }
+    let uri = mapky_resource_uri(&author_id, "geo_captures", &capture_id);
+    let tags = fetch_universal_tags_for_existing_target(
+        queries::get::get_tags_for_geo_capture(&compound_id),
+        &uri,
+        format!("GeoCapture {compound_id} not found"),
+    )
+    .await?;
     Ok(Json(tags))
 }
 
@@ -2133,9 +2128,9 @@ async fn sequence_detail_full(
     // sequence doesn't exist).
     let detail = fetch_sequence_detail(&compound_id).await?;
 
-    let (captures, (_found, tags)) = tokio::try_join!(
+    let (captures, tags) = tokio::try_join!(
         fetch_captures_in_sequence(&sequence_uri, params.captures_limit),
-        async { fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await },
+        fetch_universal_tags_for_uri(&sequence_uri),
     )?;
 
     Ok(Json(SequenceDetailFullResponse {
@@ -2351,47 +2346,14 @@ async fn collection_tags(
     State(_ctx): State<PluginContext>,
     Path((author_id, collection_id)): Path<(String, String)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
-    use std::collections::HashMap;
-
     let compound_id = format!("{author_id}:{collection_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_tags_for_collection(&compound_id))
-        .await
-        .map_err(graph_err)?;
-
-    let mut found = false;
-    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
-
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        found = true;
-        let label: Option<String> = row.get("label").ok();
-        let tagger_id: Option<String> = row.get("tagger_id").ok();
-        if let (Some(l), Some(t)) = (label, tagger_id) {
-            tag_map.entry(l).or_default().push(t);
-        }
-    }
-
-    if !found {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("Collection {compound_id} not found"),
-            }),
-        ));
-    }
-
-    let tags: Vec<PostTagDetails> = tag_map
-        .into_iter()
-        .map(|(label, taggers)| {
-            let taggers_count = taggers.len();
-            PostTagDetails {
-                label,
-                taggers,
-                taggers_count,
-            }
-        })
-        .collect();
+    let uri = mapky_resource_uri(&author_id, "posts", &collection_id);
+    let tags = fetch_universal_tags_for_existing_target(
+        queries::get::get_tags_for_collection(&compound_id),
+        &uri,
+        format!("Collection {compound_id} not found"),
+    )
+    .await?;
 
     Ok(Json(tags))
 }
@@ -2524,48 +2486,14 @@ async fn route_tags(
     State(_ctx): State<PluginContext>,
     Path((author_id, route_id)): Path<(String, String)>,
 ) -> ApiResult<Vec<PostTagDetails>> {
-    use std::collections::HashMap;
-
     let compound_id = format!("{author_id}:{route_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-
-    let mut stream = graph
-        .execute(queries::get::get_tags_for_mapky_route(&compound_id))
-        .await
-        .map_err(graph_err)?;
-
-    let mut found = false;
-    let mut tag_map: HashMap<String, Vec<String>> = HashMap::new();
-
-    while let Some(row) = stream.try_next().await.map_err(graph_err)? {
-        found = true;
-        let label: Option<String> = row.get("label").ok();
-        let tagger_id: Option<String> = row.get("tagger_id").ok();
-        if let (Some(l), Some(t)) = (label, tagger_id) {
-            tag_map.entry(l).or_default().push(t);
-        }
-    }
-
-    if !found {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("Route {compound_id} not found"),
-            }),
-        ));
-    }
-
-    let tags: Vec<PostTagDetails> = tag_map
-        .into_iter()
-        .map(|(label, taggers)| {
-            let taggers_count = taggers.len();
-            PostTagDetails {
-                label,
-                taggers,
-                taggers_count,
-            }
-        })
-        .collect();
+    let uri = mapky_resource_uri(&author_id, "routes", &route_id);
+    let tags = fetch_universal_tags_for_existing_target(
+        queries::get::get_tags_for_mapky_route(&compound_id),
+        &uri,
+        format!("Route {compound_id} not found"),
+    )
+    .await?;
 
     Ok(Json(tags))
 }
