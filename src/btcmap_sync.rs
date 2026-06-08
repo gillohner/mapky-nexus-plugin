@@ -97,55 +97,6 @@ fn config() -> &'static SyncConfig {
     })
 }
 
-/// Snapshot of where the sync currently stands. Surfaced via the
-/// `/v0/mapky/btc/status` endpoint so operators don't have to shell
-/// into Redis to confirm the job is alive.
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-pub struct SyncStatus {
-    /// Configured upstream URL — handy when troubleshooting why the
-    /// public endpoint differs from a self-hosted mirror.
-    pub upstream_url: String,
-    /// Configured refresh interval.
-    pub refresh_interval_secs: u64,
-    /// `true` when `MAPKY_BTCMAP_DISABLED` is set — the sync task
-    /// never spawns in that case.
-    pub disabled: bool,
-    /// Wall-clock timestamp (ms since epoch) of the last successful
-    /// sync, as recorded in Redis. `None` means no sync has finished
-    /// yet (still running, never ran, or Redis was unreachable).
-    pub last_sync_ms: Option<i64>,
-    /// `true` when another worker currently holds the sync lock.
-    /// Useful in multi-replica deployments.
-    pub sync_in_progress: bool,
-}
-
-/// Read sync status from Redis. Cheap — two GETs.
-pub async fn read_status() -> SyncStatus {
-    let cfg = config();
-    let mut last_sync_ms: Option<i64> = None;
-    let mut sync_in_progress = false;
-    if let Ok(mut conn) = get_redis_conn().await {
-        last_sync_ms = conn
-            .get::<_, Option<i64>>(REDIS_LAST_SYNC_KEY)
-            .await
-            .ok()
-            .flatten();
-        sync_in_progress = conn
-            .get::<_, Option<String>>(REDIS_SYNC_LOCK_KEY)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-    }
-    SyncStatus {
-        upstream_url: cfg.url.clone(),
-        refresh_interval_secs: cfg.refresh_interval.as_secs(),
-        disabled: cfg.disabled,
-        last_sync_ms,
-        sync_in_progress,
-    }
-}
-
 /// Spawn the recurring BTCMap sync as a tokio background task.
 ///
 /// Called once during plugin init. The first sync runs immediately;

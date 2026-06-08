@@ -13,7 +13,6 @@ use nexus_common::plugin::PluginContext;
 use serde::{Deserialize, Serialize};
 use utoipa::OpenApi;
 
-use crate::btcmap_sync::{self, SyncStatus};
 use crate::handlers::mapky_post::mapky_resource_label;
 use crate::models::collection::CollectionDetails;
 use crate::models::geo_capture::GeoCaptureDetails;
@@ -42,10 +41,7 @@ pub fn routes(ctx: PluginContext) -> Router {
         // Composite place-detail: detail + reviews + posts + tags +
         // collections + routes in one request. See `place_detail_full`.
         .route("/place/{osm_type}/{osm_id}/full", get(place_detail_full))
-        .route("/place/{osm_type}/{osm_id}/reviews", get(place_reviews))
-        .route("/place/{osm_type}/{osm_id}/posts", get(place_posts))
         .route("/place/{osm_type}/{osm_id}/tags", get(place_tags))
-        .route("/place/{osm_type}/{osm_id}/routes", get(place_routes))
         // ── Review ──
         .route("/reviews/{author_id}/{review_id}/tags", get(review_tags))
         .route("/reviews/user/{user_id}", get(user_reviews))
@@ -79,11 +75,6 @@ pub fn routes(ctx: PluginContext) -> Router {
             "/sequences/{author_id}/{sequence_id}/full",
             get(sequence_detail_full),
         )
-        .route("/sequences/{author_id}/{sequence_id}", get(sequence_detail))
-        .route(
-            "/sequences/{author_id}/{sequence_id}/tags",
-            get(sequence_tags),
-        )
         .route(
             "/sequences/{author_id}/{sequence_id}/captures",
             get(sequence_captures),
@@ -104,10 +95,6 @@ pub fn routes(ctx: PluginContext) -> Router {
             "/collections/{author_id}/{collection_id}/tags",
             get(collection_tags),
         )
-        .route(
-            "/collections/place/{osm_type}/{osm_id}",
-            get(collections_for_place),
-        )
         // ── Route ──
         .route("/routes/viewport", get(routes_viewport))
         .route("/routes/{author_id}/{route_id}", get(route_detail))
@@ -121,7 +108,6 @@ pub fn routes(ctx: PluginContext) -> Router {
         .route("/osm/reverse", get(osm_reverse))
         // ── BTC POI overlay (BTCMap-sourced) ──
         .route("/btc/viewport", get(btc_viewport))
-        .route("/btc/status", get(btc_status))
         // ── Cached routing proxy ──
         .route("/routing/valhalla", post(routing_valhalla))
         .with_state(ctx)
@@ -145,20 +131,19 @@ pub fn routes(ctx: PluginContext) -> Router {
     paths(
         viewport, viewport_multi,
         place_detail, place_detail_full,
-        place_reviews, place_posts, place_tags, place_routes,
+        place_tags,
         review_tags, user_reviews,
         post_tags, user_posts, resource_replies,
         incidents_viewport, incident_detail, user_incidents,
         geo_captures_viewport, geo_capture_detail, geo_capture_tags, user_geo_captures, nearby_geo_captures,
-        sequence_detail, sequence_detail_full, sequence_tags, sequence_captures, sequences_captures_by_ids, sequences_viewport, user_sequences,
-        collections_viewport, collection_detail, user_collections, collections_for_place, collection_tags,
+        sequence_detail_full, sequence_captures, sequences_captures_by_ids, sequences_viewport, user_sequences,
+        collections_viewport, collection_detail, user_collections, collection_tags,
         routes_viewport, route_detail, route_tags, user_routes,
         search_tags,
         osm_lookup,
         osm_search,
         osm_reverse,
         btc_viewport,
-        btc_status,
         routing_valhalla,
     ),
     components(schemas(
@@ -166,11 +151,11 @@ pub fn routes(ctx: PluginContext) -> Router {
         IncidentDetails, GeoCaptureDetails, SequenceDetails, CollectionDetails, RouteDetails,
         ViewportQuery, PlaceViewportQuery, MultiViewportQuery, MultiViewportResponse,
         PlaceFullQuery, PlaceFullResponse,
-        PostsQuery, PaginationQuery, NearbyQuery, SequenceCapturesByIdsBody,
+        PaginationQuery, NearbyQuery, SequenceCapturesByIdsBody,
         SequenceViewportItem, SequenceDetailFullResponse, SequenceDetailFullQuery,
         TagSearchQuery, TagSearchResponse,
         OsmLookupQuery, OsmSearchQuery, OsmReverseQuery, NominatimLookup,
-        BitcoinPoi, BitcoinCluster, BtcViewportQuery, BtcViewportResponse, SyncStatus,
+        BitcoinPoi, BitcoinCluster, BtcViewportQuery, BtcViewportResponse,
         PlaceCluster, ViewportResponse,
     ))
 )]
@@ -399,14 +384,6 @@ fn parse_place_filters(
         include_unengaged,
         min_rating,
     }
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct PostsQuery {
-    #[serde(default)]
-    pub skip: i64,
-    #[serde(default = "default_limit")]
-    pub limit: i64,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -814,10 +791,8 @@ async fn fetch_routes_in_viewport(
 
 // ── Place sub-query helpers ─────────────────────────────────────────────────
 //
-// Used by the per-slice handlers (`place_detail`, `place_reviews`,
-// `place_posts`, `place_tags`, `collections_for_place`, `place_routes`) and
-// by the composite `place_detail_full` handler, which runs them in parallel
-// after resolving the place's lat/lon.
+// Used by the place detail/tag handlers and the composite `place_detail_full`
+// handler, which runs them in parallel after resolving the place's lat/lon.
 
 async fn fetch_place_detail_by_canonical(
     osm_canonical: &str,
@@ -1469,13 +1444,13 @@ async fn resource_replies(
         .await
         .map_err(graph_err)?
         .ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiError {
-                error: format!("Unknown resource_type: {resource_type}"),
-            }),
-        )
-    })?;
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("Unknown resource_type: {resource_type}"),
+                }),
+            )
+        })?;
     let mut stream = graph
         .execute(queries::get::get_replies_for_resource(
             label,
@@ -1491,59 +1466,6 @@ async fn resource_replies(
         replies.push(mapky_post_from_row(&row));
     }
     Ok(Json(replies))
-}
-
-/// List reviews for a place
-#[utoipa::path(
-    get,
-    path = "/v0/mapky/place/{osm_type}/{osm_id}/reviews",
-    tag = "Place",
-    params(
-        ("osm_type" = String, Path, description = "OSM element type: node, way, or relation"),
-        ("osm_id" = i64, Path, description = "OSM element ID"),
-        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
-    ),
-    responses(
-        (status = 200, description = "List of reviews for the place", body = Vec<ReviewDetails>),
-        (status = 500, description = "Internal server error", body = ApiError)
-    )
-)]
-async fn place_reviews(
-    State(_ctx): State<PluginContext>,
-    Path((osm_type, osm_id)): Path<(String, i64)>,
-    Query(params): Query<PostsQuery>,
-) -> ApiResult<Vec<ReviewDetails>> {
-    let osm_canonical = format!("{osm_type}/{osm_id}");
-    let reviews = fetch_reviews_for_place(&osm_canonical, params.skip, params.limit).await?;
-    Ok(Json(reviews))
-}
-
-/// List cross-namespace `:MapkyAppPost` (comments) anchored to a place — i.e.
-/// posts whose `[:REPLY_TO]` points at a `:MapkyAppReview` for this place.
-#[utoipa::path(
-    get,
-    path = "/v0/mapky/place/{osm_type}/{osm_id}/posts",
-    tag = "Place",
-    params(
-        ("osm_type" = String, Path, description = "OSM element type: node, way, or relation"),
-        ("osm_id" = i64, Path, description = "OSM element ID"),
-        ("skip" = Option<i64>, Query, description = "Pagination offset (default 0)"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 100)"),
-    ),
-    responses(
-        (status = 200, description = "List of posts for the place", body = Vec<MapkyPostDetails>),
-        (status = 500, description = "Internal server error", body = ApiError)
-    )
-)]
-async fn place_posts(
-    State(_ctx): State<PluginContext>,
-    Path((osm_type, osm_id)): Path<(String, i64)>,
-    Query(params): Query<PostsQuery>,
-) -> ApiResult<Vec<MapkyPostDetails>> {
-    let osm_canonical = format!("{osm_type}/{osm_id}");
-    let posts = fetch_mapky_posts_for_place(&osm_canonical, params.skip, params.limit).await?;
-    Ok(Json(posts))
 }
 
 // ── Place tags ──────────────────────────────────────────────────────────────
@@ -1963,49 +1885,6 @@ fn geo_capture_from_row(row: &neo4rs::Row) -> GeoCaptureDetails {
 
 // ── Sequences ───────────────────────────────────────────────────────────────
 
-/// Get a single sequence by author and ID (tags embedded)
-#[utoipa::path(
-    get,
-    path = "/v0/mapky/sequences/{author_id}/{sequence_id}",
-    tag = "Sequence",
-    params(
-        ("author_id" = String, Path, description = "Author's pubky ID"),
-        ("sequence_id" = String, Path, description = "Sequence ID"),
-    ),
-    responses(
-        (status = 200, description = "Sequence details", body = SequenceDetails),
-        (status = 404, description = "Sequence not found"),
-        (status = 500, description = "Internal server error", body = ApiError),
-    )
-)]
-async fn sequence_detail(
-    State(_ctx): State<PluginContext>,
-    Path((author_id, sequence_id)): Path<(String, String)>,
-) -> ApiResult<SequenceDetails> {
-    let compound_id = format!("{author_id}:{sequence_id}");
-    let graph = get_neo4j_graph().map_err(graph_err)?;
-    let mut stream = graph
-        .execute(queries::get::get_sequence_by_id(&compound_id))
-        .await
-        .map_err(graph_err)?;
-
-    let mut sequence = match stream.try_next().await.map_err(graph_err)? {
-        Some(row) => sequence_from_row(&row),
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ApiError {
-                    error: format!("Sequence {compound_id} not found"),
-                }),
-            ))
-        }
-    };
-
-    let (_found, tags) = fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await?;
-    sequence.tags = Some(tags);
-    Ok(Json(sequence))
-}
-
 /// List a user's sequences
 #[utoipa::path(
     get,
@@ -2041,38 +1920,6 @@ async fn user_sequences(
         sequences.push(sequence_from_row(&row));
     }
     Ok(Json(sequences))
-}
-
-/// Get tags for a MapkyAppSequence
-#[utoipa::path(
-    get,
-    path = "/v0/mapky/sequences/{author_id}/{sequence_id}/tags",
-    tag = "Sequence",
-    params(
-        ("author_id" = String, Path, description = "Author's pubky ID"),
-        ("sequence_id" = String, Path, description = "Sequence ID"),
-    ),
-    responses(
-        (status = 200, description = "Tags on the sequence", body = Vec<PostTagDetails>),
-        (status = 404, description = "Sequence not found", body = ApiError),
-        (status = 500, description = "Internal server error", body = ApiError),
-    )
-)]
-async fn sequence_tags(
-    State(_ctx): State<PluginContext>,
-    Path((author_id, sequence_id)): Path<(String, String)>,
-) -> ApiResult<Vec<PostTagDetails>> {
-    let compound_id = format!("{author_id}:{sequence_id}");
-    let (found, tags) = fetch_tags(queries::get::get_tags_for_sequence(&compound_id)).await?;
-    if !found {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("Sequence {compound_id} not found"),
-            }),
-        ));
-    }
-    Ok(Json(tags))
 }
 
 /// List all captures in a sequence, ordered by `sequence_index` ascending.
@@ -2299,8 +2146,7 @@ async fn sequence_detail_full(
 }
 
 /// Inner helper — fetches a sequence by compound id and returns
-/// either the row or a 404. Shared between `sequence_detail` and
-/// `sequence_detail_full`.
+/// either the row or a 404. Used by `sequence_detail_full`.
 async fn fetch_sequence_detail(
     compound_id: &str,
 ) -> Result<SequenceDetails, (StatusCode, Json<ApiError>)> {
@@ -2483,29 +2329,6 @@ async fn user_collections(
         });
     }
 
-    Ok(Json(collections))
-}
-
-/// List collections that contain a specific place
-#[utoipa::path(
-    get,
-    path = "/v0/mapky/collections/place/{osm_type}/{osm_id}",
-    tag = "Collection",
-    params(
-        ("osm_type" = String, Path, description = "OSM element type"),
-        ("osm_id" = i64, Path, description = "OSM element ID"),
-    ),
-    responses(
-        (status = 200, description = "Collections containing this place", body = Vec<CollectionDetails>),
-        (status = 500, description = "Internal server error", body = ApiError)
-    )
-)]
-async fn collections_for_place(
-    State(_ctx): State<PluginContext>,
-    Path((osm_type, osm_id)): Path<(String, i64)>,
-) -> ApiResult<Vec<CollectionDetails>> {
-    let osm_canonical = format!("{osm_type}/{osm_id}");
-    let collections = fetch_collections_for_place(&osm_canonical).await?;
     Ok(Json(collections))
 }
 
@@ -2745,43 +2568,6 @@ async fn route_tags(
         .collect();
 
     Ok(Json(tags))
-}
-
-/// List routes whose bounding box covers a given OSM place. Used by the
-/// place detail panel to show "routes that pass through here".
-#[utoipa::path(
-    get,
-    path = "/v0/mapky/place/{osm_type}/{osm_id}/routes",
-    tag = "Place",
-    params(
-        ("osm_type" = String, Path, description = "OSM element type: node, way, or relation"),
-        ("osm_id" = i64, Path, description = "OSM element ID"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 50)"),
-    ),
-    responses(
-        (status = 200, description = "Routes near the place", body = Vec<RouteDetails>),
-        (status = 404, description = "Place not found"),
-        (status = 500, description = "Internal server error", body = ApiError)
-    )
-)]
-async fn place_routes(
-    State(_ctx): State<PluginContext>,
-    Path((osm_type, osm_id)): Path<(String, i64)>,
-    Query(params): Query<PaginationQuery>,
-) -> ApiResult<Vec<RouteDetails>> {
-    let osm_canonical = format!("{osm_type}/{osm_id}");
-    let detail = fetch_place_detail_by_canonical(&osm_canonical)
-        .await?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ApiError {
-                    error: format!("Place {osm_canonical} not found"),
-                }),
-            )
-        })?;
-    let routes = fetch_routes_near_point(detail.lat, detail.lon, params.limit).await?;
-    Ok(Json(routes))
 }
 
 /// Helper to parse a Neo4j row into RouteDetails.
@@ -3207,21 +2993,6 @@ async fn btc_viewport(
     }
 
     Ok(Json(BtcViewportResponse::Places { places }))
-}
-
-/// Inspect BTCMap sync state: configured upstream URL, refresh
-/// interval, last successful sync timestamp, whether a sync is
-/// currently running. Cheap call, two Redis GETs.
-#[utoipa::path(
-    get,
-    path = "/v0/mapky/btc/status",
-    tag = "BTC",
-    responses(
-        (status = 200, description = "Current BTCMap sync state", body = SyncStatus)
-    )
-)]
-async fn btc_status(State(_ctx): State<PluginContext>) -> ApiResult<SyncStatus> {
-    Ok(Json(btcmap_sync::read_status().await))
 }
 
 // ── Cached Valhalla routing ─────────────────────────────────────────────
